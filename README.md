@@ -17,7 +17,8 @@
 | カード検索 | 公式フォーム項目を全再現（フリーワード7フィールド・インク色・種別・レアリティ・クラス・能力・セット・インクウェル・5種の数値レンジ・9種のソート） |
 | 追加検索 | **効果テキストが参照する種族の逆引き**、種族 AND/OR 切替、能力タグ絞込 |
 | カード詳細 | 全項目表示、プレースホルダ描画、同名別バージョン、参照種族へのリンク |
-| シナジー探索 | 「種族Xを参照する効果を持つカード」⇄「種族Xを持つカード」を横並び表示 |
+| **AIシナジー探索** | **起点カードを選んだり、やりたいことを自由記述すると、AI が噂み合うカードをスコア＋理由付きで提案**（下記「AIシナジー探索の仕組み」参照） |
+| シナジー探索（種族逆引き） | 「種族Xを参照する効果を持つカード」⇄「種族Xを持つカード」を横並び表示 |
 | デッキビルダー | ドラッグ&ドロップ、4枚制限（`limit_card`準拠）、2色ルール検証、60枚判定、コスト曲線・インク配分・種族分布・概要の可視化 |
 | デッキコード取込 | 公式 `get-deck-cards` をサーバ側プロキシ経由で復号（レート制限付き） |
 | ルール検索 | 公式PDF 3種を横断検索。**ヒット周辺±200文字のみ表示**し公式PDF（#page=N）へ誘導 |
@@ -49,6 +50,9 @@
 | POST | `/api/cards/by-files` | `{files:[card_file,…]}` で一括取得（最大200件） |
 | GET | `/api/masters` | UI選択肢（セット・レアリティ・種別・インク色・種族・能力・参照種族・メタ） |
 | GET | `/api/synergy/:classification` | 参照カード（referrers）と保有カード（holders） |
+| **POST** | **`/api/ai/synergy`** | **AIシナジー探索**。body: `{card_file?, text?, restrict_ink?[], want?}` |
+| GET | `/api/ai/status` | AI利用可否と利用上限（鍵は返さない） |
+| GET | `/api/ai/card-suggest?q=` | 起点カードのオートコンプリート（最大20件） |
 | GET | `/api/rules/search?q=&source=` | ルール横断検索（抜粋±200文字のみ返却） |
 | GET | `/api/rules/toc` | ルール目次 |
 | GET | `/api/rules/section/:id` | 単一セクション（冒頭400文字まで） |
@@ -65,6 +69,52 @@
 
 **`/api/deck/import` のレート制限**: IP毎に 60秒 10回 / 24時間 200回。超過時 `429` + `Retry-After`。
 
+**`/api/ai/synergy` のレート制限**: IP毎に 60秒 3回 / 24時間 60回。
+同一入力は D1 に 24 時間キャッシュされ、キャッシュヒットはレート制限を消費しない（実測 55ms）。
+
+---
+
+## AIシナジー探索の仕組み
+
+`/synergy` の「AIシナジー探索」タブ。起点カードと自由記述は**どちらか一方でも、両方でも**指定可能。
+
+### 処理フロー（4段構成）
+
+| 段 | 内容 | 実装 |
+|---|---|---|
+| 1. 意図抽出 | 自由記述を検索語（keywords / 種族 / 能力 / インク色 / 種別）に分解 | `gpt-5-nano` (reasoning: minimal) |
+| 2. 候補抽出 | **D1 上の決定的な SQL** で最大 60 枚に絞る（名前指名・種族参照・同系メカニクス等を加点） | `src/lib/ai.ts` |
+| 3. 順位付け | 候補＋**総合ルールの該当条文**を渡してスコアと理由を生成 | `gpt-5-mini` (reasoning: low) |
+| 4. 突合 | LLM が返した `id` を D1 の実データに突合し、**存在しないカードを破棄** | `src/routes/ai.ts` |
+
+### 設計上のポイント
+
+- **2,500枚全体を LLM に渡していない**。候補抽出は SQL、LLM は順位付けと説明のみ担当
+- **外部知識を使わせない**。プロンプトには DB の効果テキストと総合ルールの抜粹のみを入れ、
+  キーワード能力（13種）の解釈は常に `rules_sections` から RAG で供給する
+- **幻覚カードは表示されない**。候補集外の `id` は全て破棄される
+- **ルール本文はユーザーに返さない**。RAG で参照するのは推論根拠としてのみ（BUILD_SPEC §8 を維持）
+- **API キーはサーバ側のみ**。`.dev.vars`（ローカル）/ `wrangler secret`（本番）に保持し、
+  HTML・JS・API レスポンスのいずれにも出力しない
+
+### UI
+
+- 起点カードはインクロンサル検索（`/api/ai/card-suggest`）で選択
+- 自由記述には例文ボタンを用意
+- インク色は最大2色まで絞り込み可能（ロルカナの2色ルールに準拠）
+- 結果には **スコア / 役割 / AIの理由 / DB上の根拠タグ（‹database›アイコン）/ メカニクスタグ** を併記
+- 提案カードをそのまま新しい起点にして再探索できる（‹rotate›ボタン）
+- 検索結果は `?tab=ai&card=…&q=…&ink=…` で共有可能
+- カード詳細ページからも「AIでシナジーを探す」で直接遷移できる
+
+### 応答時間（実測）
+
+| モード | 時間 |
+|---|---|
+| 起点カードのみ | 約 27 秒 |
+| 自由記述のみ（LLM 2回） | 約 24 秒 |
+| キャッシュヒット | 約 55 ms |
+
 ## データアーキテクチャ
 
 - **ストレージ**: **Cloudflare D1**（SQLite 互換）
@@ -80,7 +130,27 @@
   - `card_refs` (227) — **効果テキストが参照する種族の前計算タグ**（自身の種族は除外）
   - `faqs` (445) — カードQ&A の参照ID
   - `rules_sections` (406) — 公式ルール本文（表示は抜粋のみ）
-  - `meta` / `rate_limit`
+  - `meta` / `rate_limit` / `ai_rate_limit` / `ai_cache`
+
+### テキストとルールの保存状況（実測値）
+
+効果テキストと公式ルールは**すべて D1 上に保存済み**で、検索と AI 探索の両方がこれを直接読んでいます。
+
+| 内容 | 場所 | 実測 |
+|---|---|---|
+| 効果テキスト（プレースホルダ生） | `cards.rules_text` | 2,231 / 2,500 枚（残りは効果テキストを持たないカード） |
+| 効果テキスト（検索用・記号除去） | `cards.rules_text_plain` | 2,231 枚 |
+| 能力名（`\…\` 抽出） | `cards.ability_names` | 2,500 枚に対して付与 |
+| フレーバーテキスト | `cards.flavor_text` | 1,518 枚 |
+| 全文検索用ブロブ | `cards.search_blob` | 2,500 枚（名前+版+テキスト+作家+種族+能力） |
+| 公式ルール本文 | `rules_sections.body` | 406 節 / 約 105,000 文字（総合ルール 382・プレイ修正ガイドライン 23・セットノートS1 1） |
+| 種族・クラス | `classifications` | 5,075 行 / 42 種 |
+| キーワード能力 | `abilities` | 1,255 行 / 13 種 |
+| 効果テキストの種族参照タグ | `card_refs` | 227 行 |
+
+**\* ルール本文は DB には全文保持していますが、ユーザーへは常に抜粋のみ返します**
+（`/api/rules/search` は ±200 文字、`/api/rules/section/:id` は 400 文字まで）。
+AI 探索では推論の根拠として内部的に参照しますが、レスポンスには含めません。BUILD_SPEC §8 準拠。
 
 ### キーワード能力の構築方法（仕様書との差分・重要）
 
@@ -113,9 +183,28 @@ npm install
 npx wrangler d1 execute webapp-production --local --file=./migrations/0001_initial_schema.sql
 npx wrangler d1 execute webapp-production --local --file=./scraper/data/seed_cards.sql
 npx wrangler d1 execute webapp-production --local --file=./scraper/data/seed_rules.sql
+
+# AIシナジー探索を使う場合は .dev.vars を作成（git 管理外）
+cat > .dev.vars <<'EOF'
+OPENAI_API_KEY=sk-...
+OPENAI_BASE_URL=https://api.openai.com/v1
+AI_MODEL=gpt-5-mini
+AI_MODEL_FAST=gpt-5-nano
+EOF
+
 npm run build
 pm2 start ecosystem.config.cjs
 curl http://localhost:3000/api/health
+curl http://localhost:3000/api/ai/status   # {"available":true,…} なら AI 有効
+```
+
+**AI 未設定でもサイト全体は動作します**。`/api/ai/status` が `available:false` を返すと
+UI は AI タブに案内を出し、種族逆引きなど他の機能はそのまま使えます。
+
+### UI 自動テスト
+
+```bash
+node scraper/test_synergy_ui.mjs   # jsdom で /synergy を実動作検証（35項目）
 ```
 
 ## デプロイ（Cloudflare Pages）
@@ -179,6 +268,21 @@ jobs:
 
 **補足検証**: 全件2,500・種族トイ33件も公式APIと突合し一致を確認済み。
 
+### AIシナジー探索の検証結果
+
+| 項目 | 結果 |
+|---|---|
+| 起点カードモード（エルサ／心配する姉） | ✅ 候補60枚→8枚提案。「ロケーションのコスト2減」を正しく読み、ロケーション連動カードを上位に |
+| 自由記述モード（「変身を軽くして高コストを早出し」） | ✅ 意図抽出→`変身`能力タグ+5語。変身コスト軽減カードを95点で首位に |
+| 提案カードが全て DB 実在 | ✅ 5/5 枚が `cards` に存在（幻覚0件） |
+| インク色2色制約の遵守 | ✅ アンバー+スティール指定で違反0件 |
+| キャッシュ | ✅ 同一入力2回目は 55ms（LLM再呼び出しなし） |
+| レート制限 | ✅ 4回目以降 429 + `Retry-After` |
+| 入力バリデーション | ✅ 未入力400 / 不正JSON400 / 存在しないカード404 |
+| API キーの漏洩 | ✅ HTML・JS・APIレスポンス全てで検出0件 |
+| AI未設定時のフォールバック | ✅ `/api/ai/status` が `available:false` を返すとUIが案内表示し他機能は継続動作 |
+| UI 自動テスト（jsdom） | ✅ **35/35 パス**（`node scraper/test_synergy_ui.mjs`） |
+
 ## 未実装 / 既知の制約
 
 1. **大会ルールPDF** — 仕様書記載の URL が現在 404。総合ルール・プレイ修正
@@ -189,15 +293,21 @@ jobs:
 4. **デッキ→デッキコード発行** — 仕様書 §6.1 の判断通り未実装（公式の1日30回制限のため）。
    公式デッキビルダーへのリンクで代替
 5. **Lighthouse 90+** — 未計測（サンドボックス環境のため実測は未実施）
-6. **Cloudflare Pages への本番デプロイ** — 未実行
+6. **Cloudflare Pages への本番デプロイ** — 未実行（本番では `wrangler pages secret put OPENAI_API_KEY` が別途必要）
+7. **AI 探索の候補抽出** — ベクトル検索（embedding）でなく LIKE ＋ルールベースのスコアリング。
+   語彙が一致しない言い回しには弱い（例: 「ビートダウン」のようなスラング）
+8. **AI の応答は 20～30 秒** — ストリーミング未対応。スケルトン表示で待機させている
 
 ## 推奨される次のステップ
 
 1. `card_qa.php` を叩いて FAQ 本文を取得し、カード詳細に Q&A セクションを追加
-2. Cloudflare Pages へデプロイ（D1 の本番作成 → seed 投入 → deploy）
+   （取得できれば AI 探索の根拠にも使える）
+2. Cloudflare Pages へデプロイ（D1 の本番作成 → seed 投入 → secret 設定 → deploy）
 3. GitHub Actions で差分更新 Cron を有効化
 4. Lighthouse 計測と最適化
-5. 「未発見シナジー」スコアリング（仕様書 §11 の拡張タスク）
+5. **AI 探索をデッキ全体に拡張** — 60枚のデッキを渡して強化カード・不要カードを提案させる
+6. **AI 回答のストリーミング表示** — 体感待ち時間の短縮
+7. **ベクトル検索の導入** — 語彙不一致な自由記述への耐性向上
 
 ## 技術スタック
 
@@ -206,4 +316,6 @@ jobs:
 - **フロントエンド**: バニラJS + Tailwind CSS (CDN) + Font Awesome (CDN)
 - **スクレイパー**: Node.js 22（`fetch` / `pdftotext`）
 - **ビルド**: Vite 8 + `@hono/vite-build/cloudflare-pages`
+- **AI**: OpenAI 互換 `/chat/completions`（`gpt-5-mini` / `gpt-5-nano`、JSON mode、SDK不使用）
+- **UIテスト**: jsdom（`scraper/test_synergy_ui.mjs`）
 - **最終更新**: 2026-08-20

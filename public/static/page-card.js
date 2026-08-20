@@ -61,6 +61,10 @@ window.initCardDetailPage = function () {
                <i class="fas fa-plus mr-1"></i>デッキに追加
              </a>
            </div>
+           <a href="/synergy?tab=ai&card=${encodeURIComponent(c.card_file)}"
+              class="block py-2 bg-gradient-to-r from-amber-500 to-fuchsia-600 hover:from-amber-400 hover:to-fuchsia-500 rounded text-xs font-bold text-center text-slate-900">
+             <i class="fas fa-wand-magic-sparkles mr-1"></i>AIでシナジーを探す
+           </a>
            <a href="${esc(officialUrl)}" target="_blank" rel="noopener noreferrer"
               class="block py-2 bg-slate-800 hover:bg-slate-700 rounded text-xs text-center text-sky-300">
              <i class="fas fa-external-link-alt mr-1"></i>公式カードリストで見る

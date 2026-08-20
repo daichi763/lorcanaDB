@@ -1,5 +1,40 @@
-export type Bindings = {
+/** AI（OpenAI互換）用の環境変数。フロントには絶対に露出させない */
+export type AiEnv = {
+  OPENAI_API_KEY?: string;
+  OPENAI_BASE_URL?: string;
+  /** シナジー順位付け・理由生成に使うモデル */
+  AI_MODEL?: string;
+  /** 自由記述→検索語の変換に使う軽量モデル */
+  AI_MODEL_FAST?: string;
+};
+
+export type Bindings = AiEnv & {
   DB: D1Database;
+};
+
+/** AIプロンプト／レスポンスで使うカードの要約表現 */
+export type CardBrief = {
+  id: number;
+  card_file: string;
+  card_name: string;
+  version: string | null;
+  card_type: string;
+  ink_color: string;
+  ink_color2: string | null;
+  rarity: string;
+  inkwell: string;
+  ink_cost: number | null;
+  strength: number | null;
+  willpower: number | null;
+  lore_value: number | null;
+  move_cost: number | null;
+  rules_text: string | null;
+  rules_text_plain: string | null;
+  sets_name: string | null;
+  image_url: string;
+  /** GROUP_CONCAT の '|' 区切り生値 */
+  classifications?: string | null;
+  abilities?: string | null;
 };
 
 export type CardRow = {

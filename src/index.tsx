@@ -4,6 +4,7 @@ import { renderer } from './renderer';
 import type { Bindings } from './types';
 import api from './routes/api';
 import deckApi from './routes/deck';
+import aiApi from './routes/ai';
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -12,6 +13,7 @@ app.use(renderer);
 
 app.route('/api', api);
 app.route('/api/deck', deckApi);
+app.route('/api/ai', aiApi);
 
 // ============================ カード検索（トップ）============================
 app.get('/', (c) =>
@@ -238,18 +240,156 @@ app.get('/synergy', (c) =>
         <i class="fas fa-diagram-project text-amber-300 mr-1.5"></i>シナジー探索
       </h1>
       <p class="text-xs text-slate-400 mb-4">
-        効果テキストが特定の種族（クラス）を参照するカードと、その種族を持つカードを並べて表示します。
-        デッキの軸を見つけるための逆引き機能です。
+        カードやデッキの狙いから、噛み合うカードを探します。
+        <strong class="text-slate-300">AI探索</strong>は保存済みの効果テキストと公式ルール抜粋だけを根拠に、
+        <strong class="text-slate-300">種族逆引き</strong>は効果テキストの参照関係を機械的にたどって提示します。
       </p>
-      <div class="flex flex-wrap gap-2 items-center mb-4">
-        <label for="synergy-select" class="text-sm text-slate-300">
-          種族
-        </label>
-        <select id="synergy-select" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm min-w-[180px]">
-          <option value="">選択してください</option>
-        </select>
+
+      {/* ---- モード切替タブ ---- */}
+      <div class="flex gap-1 mb-4 border-b border-slate-700" role="tablist" aria-label="シナジー探索モード">
+        <button
+          id="tab-ai"
+          class="synergy-tab px-4 py-2 text-sm font-semibold border-b-2 border-amber-400 text-amber-300"
+          role="tab"
+          aria-selected="true"
+          data-panel="panel-ai"
+        >
+          <i class="fas fa-wand-magic-sparkles mr-1.5"></i>AIシナジー探索
+        </button>
+        <button
+          id="tab-class"
+          class="synergy-tab px-4 py-2 text-sm font-semibold border-b-2 border-transparent text-slate-400 hover:text-slate-200"
+          role="tab"
+          aria-selected="false"
+          data-panel="panel-class"
+        >
+          <i class="fas fa-users mr-1.5"></i>種族から逆引き
+        </button>
       </div>
-      <div id="synergy-result"></div>
+
+      {/* ================= AI探索パネル ================= */}
+      <section id="panel-ai" role="tabpanel" aria-labelledby="tab-ai">
+        <div
+          id="ai-unavailable"
+          class="hidden mb-4 p-3 bg-rose-950/40 border border-rose-800/60 rounded-lg text-xs text-rose-100"
+        >
+          <i class="fas fa-triangle-exclamation mr-1.5"></i>
+          AI機能は現在利用できません（APIキー未設定）。下の「種族から逆引き」はそのままご利用いただけます。
+        </div>
+
+        <div class="grid lg:grid-cols-2 gap-4 mb-4">
+          {/* --- 起点カード選択 --- */}
+          <div class="bg-slate-900/70 border border-slate-700 rounded-lg p-3.5">
+            <h2 class="text-sm font-bold mb-2">
+              <span class="inline-grid place-items-center w-5 h-5 rounded-full bg-sky-700 text-[11px] mr-1.5">1</span>
+              起点カードを選ぶ<span class="text-[11px] font-normal text-slate-500 ml-1">（任意）</span>
+            </h2>
+            <div class="relative">
+              <input
+                id="ai-card-input"
+                type="search"
+                autocomplete="off"
+                placeholder="カード名を入力（例: ミッキーマウス、エルサ…）"
+                class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm"
+                aria-label="起点カード名の検索"
+              />
+              <div
+                id="ai-card-suggest"
+                class="hidden absolute z-30 left-0 right-0 mt-1 max-h-72 overflow-y-auto bg-slate-800 border border-slate-600 rounded-lg shadow-xl"
+                role="listbox"
+              ></div>
+            </div>
+            <div id="ai-card-picked" class="mt-2.5"></div>
+          </div>
+
+          {/* --- 自由記述 --- */}
+          <div class="bg-slate-900/70 border border-slate-700 rounded-lg p-3.5">
+            <h2 class="text-sm font-bold mb-2">
+              <span class="inline-grid place-items-center w-5 h-5 rounded-full bg-fuchsia-700 text-[11px] mr-1.5">2</span>
+              やりたいことを書く<span class="text-[11px] font-normal text-slate-500 ml-1">（任意）</span>
+            </h2>
+            <textarea
+              id="ai-text"
+              rows={3}
+              maxlength={600}
+              placeholder="例) 変身を安く連発してロアを一気に稼ぎたい／護衛で守りながらアイテムを並べたい"
+              class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm resize-y"
+              aria-label="シナジーの要望を自由記述"
+            ></textarea>
+            <div class="flex flex-wrap gap-1.5 mt-2" id="ai-examples">
+              <span class="text-[10px] text-slate-500 self-center mr-0.5">例:</span>
+              <button class="js-ai-example text-[10px] px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-full">
+                変身のコストを軽くして高コストを早出しする
+              </button>
+              <button class="js-ai-example text-[10px] px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-full">
+                歌でアクションを無料で打ちたい
+              </button>
+              <button class="js-ai-example text-[10px] px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-full">
+                護衛で守りつつロアを稼ぐ
+              </button>
+              <button class="js-ai-example text-[10px] px-2 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-full">
+                相手のキャラを退場させ続けたい
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* --- オプション --- */}
+        <div class="flex flex-wrap items-end gap-3 mb-4 p-3 bg-slate-900/40 border border-slate-800 rounded-lg">
+          <div>
+            <label class="block text-[11px] text-slate-400 mb-1">インク色を絞る（最大2色）</label>
+            <div class="flex flex-wrap gap-1" id="ai-ink-filter"></div>
+          </div>
+          <div>
+            <label for="ai-want" class="block text-[11px] text-slate-400 mb-1">
+              提案枚数
+            </label>
+            <select id="ai-want" class="bg-slate-800 border border-slate-600 rounded px-2 py-1.5 text-xs">
+              <option value="8">8枚</option>
+              <option value="12" selected>
+                12枚
+              </option>
+              <option value="16">16枚</option>
+              <option value="20">20枚</option>
+            </select>
+          </div>
+          <div class="flex-1"></div>
+          <button
+            id="ai-run"
+            class="px-5 py-2.5 bg-gradient-to-r from-amber-500 to-fuchsia-600 hover:from-amber-400 hover:to-fuchsia-500 rounded-lg text-sm font-bold text-slate-900 disabled:opacity-40 disabled:cursor-not-allowed transition"
+          >
+            <i class="fas fa-wand-magic-sparkles mr-1.5"></i>AIでシナジーを探す
+          </button>
+          <button
+            id="ai-reset"
+            class="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 border border-slate-600 rounded-lg text-xs text-slate-300"
+          >
+            クリア
+          </button>
+        </div>
+
+        <div id="ai-result"></div>
+
+        <p class="mt-6 text-[11px] text-slate-500 leading-relaxed" id="ai-disclaimer">
+          <i class="fas fa-circle-info mr-1"></i>
+          AIの提案はデータベースに保存された効果テキストと公式ルールの抜粋のみを根拠にした
+          <strong>参考情報</strong>です。実際の裁定・カードの挙動は必ず公式ルールおよび公式FAQでご確認ください。
+          提案されるカードは必ずデータベース内の実在カードに限定されます。
+        </p>
+      </section>
+
+      {/* ================= 種族逆引きパネル ================= */}
+      <section id="panel-class" class="hidden" role="tabpanel" aria-labelledby="tab-class">
+        <div class="flex flex-wrap gap-2 items-center mb-4">
+          <label for="synergy-select" class="text-sm text-slate-300">
+            種族
+          </label>
+          <select id="synergy-select" class="bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm min-w-[180px]">
+            <option value="">選択してください</option>
+          </select>
+        </div>
+        <div id="synergy-result"></div>
+      </section>
       <div id="lightbox" role="dialog" aria-modal="true" aria-label="カード画像拡大">
         <button
           id="lightbox-close"
