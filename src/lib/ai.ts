@@ -80,17 +80,31 @@ export async function chatJson<T>(
   } catch {
     throw new LlmError('ai_bad_envelope');
   }
+  const finishReason: string | undefined = env2?.choices?.[0]?.finish_reason;
   const content = env2?.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || !content.trim()) throw new LlmError('ai_empty_response');
+  if (typeof content !== 'string' || !content.trim()) {
+    // 推論だけでトークンを使い切ると content が空になる（finish_reason=length）
+    throw new LlmError(`ai_empty_response (finish_reason=${finishReason ?? 'unknown'})`);
+  }
 
   let data: T;
   try {
     data = JSON.parse(content) as T;
   } catch {
-    // ```json フェンス等が混ざった場合の救済
+    // ```json フェンス等が混ざった場合の救済。
+    // 応答が途中で切れていると救済側の JSON.parse も失敗するため、
+    // 必ず捕捉して LlmError に変換する（素の SyntaxError を漏らすと 500 になる）。
     const m = content.match(/\{[\s\S]*\}/);
     if (!m) throw new LlmError('ai_bad_json');
-    data = JSON.parse(m[0]) as T;
+    try {
+      data = JSON.parse(m[0]) as T;
+    } catch {
+      throw new LlmError(`ai_bad_json_truncated (finish_reason=${finishReason ?? 'unknown'})`);
+    }
+  }
+  // JSON モードでも配列やプリミティブが返ることがあるため、オブジェクトを保証する
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    throw new LlmError('ai_unexpected_shape');
   }
   return { data, usage: env2?.usage ?? null, model: env2?.model ?? model };
 }

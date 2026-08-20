@@ -131,7 +131,14 @@ $$('.js-ai-ink')
 $('#ai-text').value = '変身のコストを軽くして高コストのキャラを早く出したい';
 $('#ai-want').value = '8';
 $('#ai-run').click();
-await wait(8000);
+// AI応答は20〜30秒かかるため固定待機ではなく描画完了までポーリングする
+// （スケルトン表示が消え「AIの見立て」かエラーが出るまで待つ）
+const deadline = Date.now() + 75_000;
+while (Date.now() < deadline) {
+  const t = $('#ai-result').textContent;
+  if (/AIの見立て/.test(t) || /失敗|エラー|上限/.test(t)) break;
+  await wait(500);
+}
 const air = $('#ai-result').textContent;
 ok('AIの見立てが描画される', /AIの見立て/.test(air), air.slice(0, 80));
 ok('シナジー候補が描画される', /シナジー候補/.test(air));

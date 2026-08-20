@@ -76,6 +76,23 @@ async function checkRate(db: D1Database, ip: string) {
   return { ok: true as const };
 }
 
+/**
+ * LLM の出力を配列として安全に扱う。
+ * JSON モードでも配列であるべき項目が文字列・オブジェクト・null で返ることがあり、
+ * そのまま .slice()/.map()/for..of すると TypeError（=HTTP 500）になる。
+ *  - 配列       → そのまま
+ *  - 文字列     → 1要素の配列（空文字は空配列）
+ *  - オブジェクト → 値の配列（{"1":{...}} 形式の救済）
+ *  - null/undefined/その他 → 空配列
+ */
+function toArray<T>(v: unknown): T[] {
+  if (Array.isArray(v)) return v as T[];
+  if (v == null) return [];
+  if (typeof v === 'string') return v.trim() ? ([v] as unknown as T[]) : [];
+  if (typeof v === 'object') return Object.values(v as Record<string, unknown>) as T[];
+  return [v] as unknown as T[];
+}
+
 /** Workers に crypto.subtle はあるが同期ハッシュが無いのでシンプルな安定ハッシュを使う */
 function cacheKey(s: string): string {
   let h1 = 0x811c9dc5;
@@ -215,7 +232,7 @@ ai.post('/synergy', async (c) => {
             timeoutMs: 15_000,
           }
         );
-        intent = r.data ?? {};
+        intent = r.data && typeof r.data === 'object' && !Array.isArray(r.data) ? r.data : {};
       } catch {
         // 意図抽出に失敗しても、生テキストを語分割してフォールバック
         intent = { keywords: freeText.split(/[\s、。,.／/]+/).filter((w) => w.length >= 2).slice(0, 6) };
@@ -223,13 +240,19 @@ ai.post('/synergy', async (c) => {
     }
 
     // ---- 第2段: D1 から候補抽出（決定的） ----
+    // 意図抽出の各項目も型がゆらぐため、SQL に渡す前に文字列配列へ正規化する
+    const asStrings = (v: unknown) =>
+      toArray<unknown>(v)
+        .map((x) => String(x ?? '').trim())
+        .filter(Boolean);
+
     const candidates: Candidate[] = await retrieveCandidates(db, {
       base,
-      keywords: intent.keywords ?? [],
-      classifications: intent.classifications ?? [],
-      abilities: intent.abilities ?? [],
-      inkColors: intent.ink_colors ?? [],
-      cardTypes: intent.card_types ?? [],
+      keywords: asStrings(intent.keywords),
+      classifications: asStrings(intent.classifications),
+      abilities: asStrings(intent.abilities),
+      inkColors: asStrings(intent.ink_colors),
+      cardTypes: asStrings(intent.card_types),
       restrictInk,
       limit: 60,
     });
@@ -277,10 +300,13 @@ ai.post('/synergy', async (c) => {
     );
 
     // ---- 第4段: LLM出力を D1 実データに突合（幻覚カードを除去） ----
+    // LLM は JSON モードでも picks を文字列やオブジェクトで返すことがある。
+    // 配列前提で反復・map すると TypeError で 500 になるため、必ず正規化する。
     const byId = new Map(candidates.map((x) => [Number(x.id), x]));
     const seen = new Set<number>();
     const results: any[] = [];
-    for (const p of ranked.data.picks ?? []) {
+    for (const p of toArray<any>(ranked.data.picks)) {
+      if (!p || typeof p !== 'object') continue;
       const id = Number(p.id);
       const card = byId.get(id);
       if (!card || seen.has(id)) continue;
@@ -302,14 +328,14 @@ ai.post('/synergy', async (c) => {
       intent: intent.intent ?? null,
       intent_detail: freeText
         ? {
-            keywords: intent.keywords ?? [],
-            classifications: intent.classifications ?? [],
-            abilities: intent.abilities ?? [],
+            keywords: toArray<string>(intent.keywords),
+            classifications: toArray<string>(intent.classifications),
+            abilities: toArray<string>(intent.abilities),
           }
         : null,
       summary: typeof ranked.data.summary === 'string' ? ranked.data.summary.slice(0, 900) : '',
-      axes: (ranked.data.axes ?? []).slice(0, 6).map((x) => String(x).slice(0, 60)),
-      caveats: (ranked.data.caveats ?? []).slice(0, 5).map((x) => String(x).slice(0, 240)),
+      axes: toArray<unknown>(ranked.data.axes).slice(0, 6).map((x) => String(x).slice(0, 60)),
+      caveats: toArray<unknown>(ranked.data.caveats).slice(0, 5).map((x) => String(x).slice(0, 240)),
       results,
       candidate_count: candidates.length,
       rule_context_count: ruleContext.length,
@@ -330,14 +356,23 @@ ai.post('/synergy', async (c) => {
 
     return c.json(payload);
   } catch (e: any) {
-    const status = e instanceof LlmError ? e.status : 500;
-    const msg =
-      e instanceof LlmError
-        ? e.message.startsWith('ai_timeout')
-          ? 'AIの応答がタイムアウトしました。もう一度お試しください。'
+    // 原因追跡用（メッセージのみ。プロンプトやキーは出さない）
+    console.error('[AI_ERROR]', e?.constructor?.name, '|', String(e?.message ?? '').slice(0, 300));
+
+    const isLlm = e instanceof LlmError;
+    const raw = String(e?.message ?? '');
+    const msg = isLlm
+      ? raw.startsWith('ai_timeout')
+        ? 'AIの応答がタイムアウトしました。もう一度お試しください。'
+        : raw.startsWith('ai_bad_json') || raw.startsWith('ai_unexpected_shape') || raw.startsWith('ai_empty_response')
+          ? 'AIの回答を解釈できませんでした。もう一度お試しください（内容を少し変えると成功しやすくなります）。'
           : 'AIの呼び出しに失敗しました。しばらく待ってからお試しください。'
-        : 'サーバー内部エラーが発生しました。';
-    return c.json({ error: 'ai_failed', message: msg, detail: String(e?.message ?? '').slice(0, 200) }, status as any);
+      : 'AIの処理中に想定外のエラーが発生しました。もう一度お試しください。';
+
+    return c.json(
+      { error: 'ai_failed', message: msg, detail: raw.slice(0, 200) },
+      (isLlm ? e.status : 502) as any
+    );
   }
 });
 

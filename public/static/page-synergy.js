@@ -333,11 +333,22 @@ window.initSynergyPage = function () {
       history.replaceState(null, '', location.pathname + '?' + p.toString());
     } catch (e) {
       const msg = (e.payload && e.payload.message) || 'AI検索に失敗しました。';
+      // 429（回数制限）以外はほぼ一時的な失敗なので、その場で再試行できるようにする
+      const retryable = e.status !== 429;
       box.innerHTML =
         `<div class="p-4 bg-rose-950/40 border border-rose-800/60 rounded-lg text-sm text-rose-100">
            <i class="fas fa-circle-exclamation mr-1.5"></i>${esc(msg)}
-           ${e.status === 429 ? '<p class="text-[11px] text-rose-200/70 mt-1">AI検索は負荷が高いため回数を制限しています。</p>' : ''}
+           ${e.status === 429
+             ? '<p class="text-[11px] text-rose-200/70 mt-1">AI検索は負荷が高いため回数を制限しています。</p>'
+             : `<p class="text-[11px] text-rose-200/70 mt-1">一時的な失敗の可能性があります。条件はそのままで再試行できます。</p>
+                <button class="js-ai-retry mt-2 px-3 py-1.5 rounded bg-rose-800/60 hover:bg-rose-700/60 text-xs font-bold">
+                  <i class="fas fa-rotate-right mr-1"></i>再試行する
+                </button>`}
          </div>`;
+      if (retryable) {
+        const rb = box.querySelector('.js-ai-retry');
+        if (rb) rb.addEventListener('click', () => runAi());
+      }
     } finally {
       btn.disabled = false;
       btn.innerHTML = '<i class="fas fa-wand-magic-sparkles mr-1.5"></i>AIでシナジーを探す';
