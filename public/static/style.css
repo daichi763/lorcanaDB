@@ -1,1 +1,215 @@
-h1 { font-family: Arial, Helvetica, sans-serif; }
+/* ================================================================
+   非公式カードデータベース — カスタムスタイル
+   ================================================================ */
+
+:root {
+  --ink-amber: #f0b429;
+  --ink-amethyst: #a855f7;
+  --ink-emerald: #10b981;
+  --ink-ruby: #ef4444;
+  --ink-sapphire: #3b82f6;
+  --ink-steel: #94a3b8;
+}
+
+/* ---- 効果テキスト用アイコン ---- */
+.lor-ico-wrap {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: -0.18em;
+  margin: 0 0.08em;
+}
+.lor-ico {
+  width: 1.05em;
+  height: 1.05em;
+  display: block;
+}
+
+/* ---- 効果テキスト ---- */
+.rules-text {
+  line-height: 1.75;
+  word-break: break-word;
+}
+.rules-text .ability-name {
+  letter-spacing: 0.01em;
+}
+.rules-text br {
+  content: '';
+  display: block;
+  margin-bottom: 0.35em;
+}
+
+/* ---- インク色チップ ---- */
+.ink-chip {
+  display: inline-block;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 9999px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+}
+.ink-アンバー    { background: var(--ink-amber); }
+.ink-アメジスト  { background: var(--ink-amethyst); }
+.ink-エメラルド  { background: var(--ink-emerald); }
+.ink-ルビー      { background: var(--ink-ruby); }
+.ink-サファイア  { background: var(--ink-sapphire); }
+.ink-スティール  { background: var(--ink-steel); }
+
+/* インク色ボーダー（カード枠） */
+.border-ink-アンバー   { border-color: var(--ink-amber); }
+.border-ink-アメジスト { border-color: var(--ink-amethyst); }
+.border-ink-エメラルド { border-color: var(--ink-emerald); }
+.border-ink-ルビー     { border-color: var(--ink-ruby); }
+.border-ink-サファイア { border-color: var(--ink-sapphire); }
+.border-ink-スティール { border-color: var(--ink-steel); }
+
+/* ---- カード画像（公式サーバ直リンク / §5 モードA）---- */
+.card-thumb {
+  aspect-ratio: 5 / 7;
+  background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+  border-radius: 0.55rem;
+  overflow: hidden;
+  position: relative;
+}
+.card-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  transition: transform 0.25s ease;
+}
+.card-thumb img.is-error {
+  opacity: 0;
+}
+.card-thumb-fallback {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0.5rem;
+  text-align: center;
+  font-size: 0.62rem;
+  color: #64748b;
+}
+.card-thumb.has-error .card-thumb-fallback {
+  display: flex;
+}
+.card-tile:hover .card-thumb img {
+  transform: scale(1.04);
+}
+
+/* ---- スケルトン ---- */
+.skeleton {
+  background: linear-gradient(90deg, #1e293b 25%, #334155 50%, #1e293b 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s infinite;
+}
+@keyframes shimmer {
+  0%   { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* ---- スクロールバー ---- */
+.thin-scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.thin-scroll::-webkit-scrollbar-track { background: #0f172a; }
+.thin-scroll::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+.thin-scroll::-webkit-scrollbar-thumb:hover { background: #64748b; }
+
+/* ---- ライトボックス（鑑賞モード）---- */
+#lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 6, 23, 0.92);
+  backdrop-filter: blur(4px);
+  padding: 1rem;
+}
+#lightbox.open { display: flex; }
+#lightbox img {
+  max-width: min(94vw, 620px);
+  max-height: 88vh;
+  border-radius: 0.9rem;
+  box-shadow: 0 25px 60px rgba(0, 0, 0, 0.7);
+}
+
+/* ---- デッキビルダー: ドラッグ&ドロップ ---- */
+.drop-zone {
+  transition: background-color 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+.drop-zone.drag-over {
+  background-color: rgba(56, 189, 248, 0.1);
+  border-color: #38bdf8 !important;
+  box-shadow: inset 0 0 0 2px rgba(56, 189, 248, 0.45);
+}
+.card-tile[draggable='true'] { cursor: grab; }
+.card-tile.dragging { opacity: 0.4; }
+
+/* デッキ内カードの重ね表示 */
+.deck-stack-item {
+  transition: transform 0.15s;
+}
+.deck-stack-item:hover {
+  transform: translateY(-3px);
+  z-index: 5;
+}
+
+/* ---- コストカーブのバー ---- */
+.curve-bar {
+  transition: height 0.35s cubic-bezier(0.22, 1, 0.36, 1);
+  min-height: 2px;
+}
+
+/* ---- チェックボックス群（公式風の複数選択）---- */
+.chip-check {
+  cursor: pointer;
+  user-select: none;
+}
+.chip-check input { position: absolute; opacity: 0; pointer-events: none; }
+.chip-check span {
+  display: inline-block;
+  padding: 0.2rem 0.6rem;
+  border-radius: 9999px;
+  font-size: 0.72rem;
+  border: 1px solid #334155;
+  background: #1e293b;
+  color: #cbd5e1;
+  transition: all 0.12s;
+  white-space: nowrap;
+}
+.chip-check:hover span { border-color: #64748b; }
+.chip-check input:checked + span {
+  background: #0ea5e9;
+  border-color: #0ea5e9;
+  color: #04283b;
+  font-weight: 700;
+}
+.chip-check input:focus-visible + span {
+  outline: 2px solid #f0b429;
+  outline-offset: 2px;
+}
+
+/* ---- アクセシビリティ ---- */
+.sr-only {
+  position: absolute;
+  width: 1px; height: 1px;
+  padding: 0; margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+:focus-visible {
+  outline: 2px solid #f0b429;
+  outline-offset: 2px;
+}
+
+/* ---- 印刷 ---- */
+@media print {
+  header, footer, .no-print { display: none !important; }
+  body { background: #fff; color: #000; }
+}

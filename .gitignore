@@ -31,3 +31,9 @@ lerna-debug.log*
 
 # misc
 .DS_Store
+
+# スクレイピング生成物（サイズが大きいため）
+scraper/data/*.sql
+scraper/data/cards.jsonl
+.wrangler/
+dist/

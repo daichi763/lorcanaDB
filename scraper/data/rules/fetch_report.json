@@ -1,0 +1,44 @@
+{
+  "fetched_at": "2026-08-20T08:39:13.763Z",
+  "report": [
+    {
+      "source": "comprehensive",
+      "label": "総合ルール",
+      "url": "https://www.takaratomy.co.jp/products/disneylorcana/common/pdf/Disney-Lorcana-Comprehensive-Rules_JP.pdf",
+      "status": 200,
+      "bytes": 4347763,
+      "sections": 382
+    },
+    {
+      "source": "guidelines",
+      "label": "プレイ修正ガイドライン",
+      "url": "https://www.takaratomy.co.jp/products/disneylorcana/common/pdf/Disney_Lorcana_Play_Correction_Guidelines_JP.pdf",
+      "status": 200,
+      "bytes": 407820,
+      "sections": 23
+    },
+    {
+      "source": "tournament",
+      "label": "大会ルール",
+      "url": "https://www.takaratomy.co.jp/products/disneylorcana/common/pdf/Disney_Tournament_Rules_JP.pdf",
+      "status": 404,
+      "sections": 0
+    },
+    {
+      "source": "set_notes_s1",
+      "label": "セットノート S1",
+      "url": "https://www.takaratomy.co.jp/products/disneylorcana/common/pdf/s1_set_notes.pdf",
+      "status": 200,
+      "bytes": 1200424,
+      "sections": 1
+    },
+    {
+      "source": "playsheet",
+      "label": "プレイシート",
+      "url": "https://www.takaratomy.co.jp/products/disneylorcana/common/pdf/playsheet.pdf",
+      "status": 200,
+      "bytes": 36011053,
+      "sections": 0
+    }
+  ]
+}
