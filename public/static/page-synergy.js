@@ -312,7 +312,7 @@ window.initSynergyPage = function () {
     btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1.5"></i>探索中…';
     box.innerHTML =
       `<div class="p-4 bg-slate-900/60 border border-slate-700 rounded-lg">
-         <p class="text-xs text-slate-400 mb-3"><i class="fas fa-database mr-1"></i>候補カードを抽出し、AIが噛み合いを検討しています（10〜30秒程度）…</p>
+         <p class="text-xs text-slate-400 mb-3"><i class="fas fa-database mr-1"></i>候補カード120枚と総合ルールを読み込み、AIが噛み合いを検討しています（20〜60秒程度）…</p>
          <div class="space-y-2">${'<div class="h-24 skeleton rounded-lg"></div>'.repeat(4)}</div>
        </div>`;
 

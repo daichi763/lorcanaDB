@@ -228,8 +228,8 @@ ai.post('/synergy', async (c) => {
             // 意図抽出は単純な変換なので最小コスト・最高速のモデルで十分
             model: c.env.AI_MODEL_FAST || 'gpt-5-nano',
             reasoningEffort: 'minimal',
-            maxTokens: 700,
-            timeoutMs: 15_000,
+            maxTokens: 2000,
+            timeoutMs: 25_000,
           }
         );
         intent = r.data && typeof r.data === 'object' && !Array.isArray(r.data) ? r.data : {};
@@ -254,7 +254,9 @@ ai.post('/synergy', async (c) => {
       inkColors: asStrings(intent.ink_colors),
       cardTypes: asStrings(intent.card_types),
       restrictInk,
-      limit: 60,
+      // 候補を60→120枚に拡大。実測では入力トークンが倍増しても所要時間はほぼ変わらず
+      // （32.6秒 vs 34.0秒）、見落としの削減にそのまま効く。
+      limit: 120,
     });
 
     if (!candidates.length) {
@@ -274,8 +276,9 @@ ai.post('/synergy', async (c) => {
     // ---- ルール抜粋（キーワード能力の正確な解釈のため） ----
     const kwTerms = new Set<string>();
     for (const k of String(base?.abilities ?? '').split('|')) if (k) kwTerms.add(k);
-    for (const k of intent.abilities ?? []) kwTerms.add(k);
-    for (const cand of candidates.slice(0, 25)) {
+    for (const k of asStrings(intent.abilities)) kwTerms.add(k);
+    // 候補を120枚に増やしたので、キーワード収集の範囲も上位50枚まで広げる
+    for (const cand of candidates.slice(0, 50)) {
       for (const k of String(cand.abilities ?? '').split('|')) if (k && KEYWORDS.includes(k)) kwTerms.add(k);
     }
     const ruleContext = await fetchRuleContext(db, [...kwTerms]);
@@ -296,7 +299,10 @@ ai.post('/synergy', async (c) => {
         { role: 'system', content: SYSTEM_PROMPT },
         { role: 'user', content: prompt },
       ],
-      { reasoningEffort: 'low', maxTokens: 4000, timeoutMs: 40_000 }
+      // 候補120枚・効果テキスト320字でも入力2.6万トークン／出力2,500〜5,700トークン程度。
+      // 実測で最大72秒かかるケースがあるため、タイムアウトは十分な余裕を取る。
+      // （max_completion_tokens は現行プロキシでは尊重されないが、将来のため上限値を明示しておく）
+      { reasoningEffort: 'low', maxTokens: 16_000, timeoutMs: 90_000 }
     );
 
     // ---- 第4段: LLM出力を D1 実データに突合（幻覚カードを除去） ----

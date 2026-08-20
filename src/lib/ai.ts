@@ -218,10 +218,14 @@ export type RetrieveOptions = {
  * 候補カードを D1 から抽出する。
  * 「LLMに渡す前に十分絞る」ことが目的なので、精度より網羅を優先し、
  * 最終的なスコア順で limit 件に切る。
+ *
+ * 各サブクエリの LIMIT は「プールが limit(=120) を下回らない」ように広めに取る。
+ * 入力トークンを増やしても実測レイテンシはほぼ変わらないため（候補60枚→120枚で
+ * 34.0s→32.6s）、ここを絞るメリットは薄く、逆に見落としの原因になる。
  */
 export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Promise<Candidate[]> {
   const pool: Pool = new Map();
-  const limit = o.limit ?? 60;
+  const limit = o.limit ?? 120;
   const base = o.base ?? null;
   const baseId = base ? Number(base.id) : -1;
 
@@ -244,7 +248,7 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
     // (1) このカードの名前を効果テキストで直接指名しているカード = 最強シナジー
     if (baseName) {
       push(
-        q(`${BRIEF_SELECT} WHERE c.id <> ? AND c.rules_text_plain LIKE ? ESCAPE '\\' LIMIT 30`, [
+        q(`${BRIEF_SELECT} WHERE c.id <> ? AND c.rules_text_plain LIKE ? ESCAPE '\\' LIMIT 40`, [
           baseId, `%${likeEsc(baseName)}%`,
         ]),
         10,
@@ -258,7 +262,7 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
         q(
           `${BRIEF_SELECT} WHERE c.id <> ? AND c.id IN
              (SELECT card_id FROM card_refs WHERE classification IN (${baseCls.map(() => '?').join(',')}))
-           ORDER BY c.sets_order DESC LIMIT 40`,
+           ORDER BY c.sets_order DESC LIMIT 70`,
           [baseId, ...baseCls]
         ),
         6,
@@ -280,7 +284,7 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
         q(
           `${BRIEF_SELECT} WHERE c.id <> ? AND c.id IN
              (SELECT card_id FROM classifications WHERE classification IN (${refCls.map(() => '?').join(',')}))
-           ORDER BY c.sets_order DESC LIMIT 40`,
+           ORDER BY c.sets_order DESC LIMIT 70`,
           [baseId, ...refCls]
         ),
         6,
@@ -300,13 +304,13 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
     }
 
     // (5) 同じキーワード能力を持つ / それを付与・参照するカード
-    for (const ab of baseAb.slice(0, 5)) {
+    for (const ab of baseAb.slice(0, 6)) {
       push(
         q(
           `${BRIEF_SELECT} WHERE c.id <> ?
              AND (c.id IN (SELECT card_id FROM abilities WHERE ability = ?)
                   OR c.rules_text_plain LIKE ? ESCAPE '\\')
-           ORDER BY c.sets_order DESC LIMIT 24`,
+           ORDER BY c.sets_order DESC LIMIT 40`,
           [baseId, ab, `%${likeEsc(ab)}%`]
         ),
         3,
@@ -315,14 +319,14 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
     }
 
     // (6) 同系メカニクス
-    for (const tag of detectMechanics(baseText).slice(0, 6)) {
+    for (const tag of detectMechanics(baseText).slice(0, 8)) {
       const terms = MECHANIC_LEXICON[tag] ?? [];
       const t = terms.filter((x) => x.length >= 2).slice(0, 3);
       if (!t.length) continue;
       push(
         q(
           `${BRIEF_SELECT} WHERE c.id <> ? AND (${t.map(() => `c.rules_text_plain LIKE ? ESCAPE '\\'`).join(' OR ')})
-           ORDER BY c.sets_order DESC LIMIT 18`,
+           ORDER BY c.sets_order DESC LIMIT 30`,
           [baseId, ...t.map((x) => `%${likeEsc(x)}%`)]
         ),
         2,
@@ -332,14 +336,14 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
   }
 
   // ---------- 自由記述由来のキーワード ----------
-  for (const kw of (o.keywords ?? []).slice(0, 8)) {
+  for (const kw of (o.keywords ?? []).slice(0, 12)) {
     const k = kw.trim();
     if (k.length < 2) continue;
     push(
       q(
         `${BRIEF_SELECT} WHERE (c.rules_text_plain LIKE ? ESCAPE '\\' OR c.ability_names LIKE ? ESCAPE '\\'
                                 OR c.card_name LIKE ? ESCAPE '\\')
-         ORDER BY c.sets_order DESC LIMIT 24`,
+         ORDER BY c.sets_order DESC LIMIT 45`,
         [`%${likeEsc(k)}%`, `%${likeEsc(k)}%`, `%${likeEsc(k)}%`]
       ),
       4,
@@ -347,11 +351,11 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
     );
   }
 
-  for (const cl of (o.classifications ?? []).slice(0, 5)) {
+  for (const cl of (o.classifications ?? []).slice(0, 8)) {
     push(
       q(
         `${BRIEF_SELECT} WHERE c.id IN (SELECT card_id FROM classifications WHERE classification = ?)
-         ORDER BY c.sets_order DESC LIMIT 24`,
+         ORDER BY c.sets_order DESC LIMIT 45`,
         [cl]
       ),
       4,
@@ -360,7 +364,7 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
     push(
       q(
         `${BRIEF_SELECT} WHERE c.id IN (SELECT card_id FROM card_refs WHERE classification = ?)
-         ORDER BY c.sets_order DESC LIMIT 20`,
+         ORDER BY c.sets_order DESC LIMIT 35`,
         [cl]
       ),
       5,
@@ -368,11 +372,11 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
     );
   }
 
-  for (const ab of (o.abilities ?? []).slice(0, 5)) {
+  for (const ab of (o.abilities ?? []).slice(0, 8)) {
     push(
       q(
         `${BRIEF_SELECT} WHERE c.id IN (SELECT card_id FROM abilities WHERE ability = ?)
-         ORDER BY c.sets_order DESC LIMIT 24`,
+         ORDER BY c.sets_order DESC LIMIT 45`,
         [ab]
       ),
       4,
@@ -411,6 +415,64 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
   }
 
   list.sort((a, b) => b._score - a._score || Number(b.id) - Number(a.id));
+
+  // ---------- 不足分の補充（トークン枠が広がったので「空振り」を潰す） ----------
+  // 自由記述の意図抽出が弱い語（例:「コントロ」「回す」）しか返さず、かつ
+  // card_types / restrictInk のハードフィルタが効くと候補0件になることがあった。
+  // 指定された色・種類・種族に合致するカードで limit まで機械的に埋める。
+  if (list.length < limit) {
+    const have = new Set(list.map((c) => Number(c.id)));
+    const inks = restrict.length ? restrict : (o.inkColors ?? []).filter(Boolean);
+    const cls = (o.classifications ?? []).filter(Boolean).slice(0, 8);
+    const types = (o.cardTypes ?? []).filter(Boolean);
+
+    // 意図抽出は「キャラクター」を種族として返すなど揺らぐため、
+    // 条件を厳しい順に試し、埋まらなければ段階的に緩める。
+    const passes: Array<{ cls: string[]; types: string[]; inks: string[]; why: string }> = [
+      { cls, types, inks, why: '指定条件（色／種類／種族）に合致' },
+      { cls: [], types, inks, why: '指定条件（色／カード種類）に合致' },
+      { cls: [], types: [], inks, why: '指定インク色に合致' },
+    ];
+    // インク色を2色に固定している場合、その制約を破る補充はしない
+    if (!restrict.length) passes.push({ cls: [], types: [], inks: [], why: '同カテゴリからの補充' });
+
+    for (const p of passes) {
+      if (list.length >= limit) break;
+      const where: string[] = ['c.id <> ?', `COALESCE(c.rules_text_plain, '') <> ''`];
+      const binds: unknown[] = [baseId];
+      if (p.inks.length) {
+        where.push(`(${p.inks.map(() => '(c.ink_color = ? OR c.ink_color2 = ?)').join(' OR ')})`);
+        for (const i of p.inks) binds.push(i, i);
+      }
+      if (p.types.length) {
+        where.push(`c.card_type IN (${p.types.map(() => '?').join(',')})`);
+        binds.push(...p.types);
+      }
+      if (p.cls.length) {
+        where.push(
+          `c.id IN (SELECT card_id FROM classifications WHERE classification IN (${p.cls
+            .map(() => '?')
+            .join(',')}))`
+        );
+        binds.push(...p.cls);
+      }
+
+      const need = limit - list.length;
+      const rows = await q(
+        `${BRIEF_SELECT} WHERE ${where.join(' AND ')}
+         ORDER BY c.sets_order DESC, c.ink_cost ASC LIMIT ?`,
+        [...binds, need * 3 + 30]
+      );
+      for (const r of rows) {
+        const id = Number(r.id);
+        if (have.has(id)) continue;
+        have.add(id);
+        list.push({ ...(r as CardBrief), _score: 0.1, _why: [p.why] });
+        if (list.length >= limit) break;
+      }
+    }
+  }
+
   return list.slice(0, limit);
 }
 
@@ -422,7 +484,10 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
  * ※ ユーザーには返さない（§8: 全文公開はしない）。あくまで推論の根拠。
  */
 export async function fetchRuleContext(db: D1Database, terms: string[]): Promise<string[]> {
-  const uniq = [...new Set(terms.filter((t) => KEYWORDS.includes(t)))].slice(0, 6);
+  // 対象キーワードを 6→10 個、取得節を 12→24 節、本文を 400→900 字に拡大。
+  // キーワード能力の裁定はロルカナのシナジー判断の中核であり、
+  // ここを削ると「そのターンだけ」「チャレンジ中のみ」等の条件を読み落とす。
+  const uniq = [...new Set(terms.filter((t) => KEYWORDS.includes(t)))].slice(0, 10);
   if (!uniq.length) return [];
 
   const rows = await db
@@ -430,13 +495,13 @@ export async function fetchRuleContext(db: D1Database, terms: string[]): Promise
       `SELECT section, heading, body FROM rules_sections
         WHERE source = 'comprehensive'
           AND (${uniq.map(() => 'heading LIKE ?').join(' OR ')})
-        ORDER BY CAST(section AS REAL) LIMIT 12`
+        ORDER BY CAST(section AS REAL) LIMIT 24`
     )
     .bind(...uniq.map((t) => `%${t}%`))
     .all();
 
   return ((rows.results ?? []) as any[]).map(
-    (r) => `[総合ルール ${r.section} ${r.heading ?? ''}] ${String(r.body ?? '').slice(0, 400)}`
+    (r) => `[総合ルール ${r.section} ${r.heading ?? ''}] ${String(r.body ?? '').slice(0, 900)}`
   );
 }
 
@@ -455,7 +520,9 @@ function briefLine(c: Candidate): string {
   ]
     .filter(Boolean)
     .join(' ');
-  const text = String(c.rules_text_plain ?? '').replace(/\s+/g, ' ').slice(0, 190);
+  // 効果テキストは190→320字に拡大。長文カードの後半（追加の誘発条件など）が
+  // 切り落とされて誤判断につながるのを防ぐ。
+  const text = String(c.rules_text_plain ?? '').replace(/\s+/g, ' ').slice(0, 320);
   return [
     `#${c.id}`,
     `${c.card_name}${c.version ? `／${c.version}` : ''}`,
