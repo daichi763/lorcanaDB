@@ -8,6 +8,10 @@ export type AiEnv = {
   AI_MODEL_FAST?: string;
   /** 記憶層の構築（ベクトル化等）を許可する管理トークン。本番では必須 */
   ADMIN_TOKEN?: string;
+  /** 隠し管理画面のログインパスワード。未設定時は ADMIN_TOKEN で代替 */
+  ADMIN_PASSWORD?: string;
+  /** 管理画面を開く別パス（既定 /_ops のほかに、推測されにくいURLを割り当てる） */
+  ADMIN_PATH?: string;
 };
 
 export type Bindings = AiEnv & {

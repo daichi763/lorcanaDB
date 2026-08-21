@@ -7,7 +7,7 @@
 - **目的**: 全カードデータ・公式ルールを取り込み、公式サイト同等の検索UIと
   デッキコード互換のデッキビルダーを提供する
 - **収録**: **2,500 枚**（公式 API の `count` と完全一致）、26 セット、42 種族、
-  1,255 件のキーワード能力タグ、406 節の公式ルール
+  1,255 件のキーワード能力タグ、463 節の公式ルール
 - **ステータス**: サンドボックスで稼働確認済み / Cloudflare Pages 未デプロイ
 
 ## 主な機能
@@ -21,10 +21,11 @@
 | シナジー探索（種族逆引き） | 「種族Xを参照する効果を持つカード」⇄「種族Xを持つカード」を横並び表示 |
 | デッキビルダー | ドラッグ&ドロップ、4枚制限（`limit_card`準拠）、2色ルール検証、60枚判定、コスト曲線・インク配分・種族分布・概要の可視化 |
 | デッキコード取込 | 公式 `get-deck-cards` をサーバ側プロキシ経由で復号（レート制限付き） |
-| ルール検索 | 公式PDF 3種を横断検索。**ヒット周辺±200文字のみ表示**し公式PDF（#page=N）へ誘導 |
+| ルール検索 | 公式PDF 4種（総合ルール・プレイ修正ガイドライン・大会ルール・セットノート）を横断検索。**ヒット周辺±200文字のみ表示**し公式PDF（#page=N）へ誘導 |
 | 比較モード | 最大4枚を並列表示 |
 | 鑑賞モード | 公式画像を lightbox 拡大 |
 | お気に入り | LocalStorage のみ（ログイン不要・サーバ送信なし） |
+| **データ更新（隠し管理画面）** | **公式の新弾追加・ルール改定に追随。パスワード保護された非公開URLから差分更新を実行**（下記「データ更新（隠し管理画面）」参照） |
 
 ## URL / エンドポイント
 
@@ -40,6 +41,7 @@
 | `/favorites` | お気に入り |
 | `/about` | このサイトについて（免責・権利・データ取得方針） |
 | `/robots.txt` | クロール方針 |
+| `/_ops`（および `ADMIN_PATH` で指定した任意パス） | **隠し管理画面（データ更新）**。サイト内リンクなし・パスワード必須・`noindex` / `robots.txt` で拒否。詳細は「データ更新（隠し管理画面）」節 |
 
 ### API
 
@@ -58,6 +60,20 @@
 | GET | `/api/rules/section/:id` | 単一セクション（冒頭400文字まで） |
 | POST | `/api/deck/import` | `{code:"…"}` → 公式APIプロキシでデッキ復号 |
 | GET | `/api/health` | ヘルスチェック |
+
+**管理API（`/api/_ops/*`）** — 隠し管理画面専用。CORS を付けない（同一オリジン限定）、`Cache-Control: no-store`、`X-Robots-Tag: noindex`。
+
+| メソッド | パス | 内容 |
+|---|---|---|
+| POST | `/api/_ops/login` | `{password}` → 署名付きセッション Cookie 発行（2時間） |
+| POST | `/api/_ops/logout` | セッション破棄 |
+| GET | `/api/_ops/session` | セッション有効判定 |
+| GET | `/api/_ops/status` | 件数・ベクトル進捗・公式文書のバージョン・ジョブ履歴 |
+| POST | `/api/_ops/update/cards` | カード差分更新（1回の呼び出しで5ページ進める分割ジョブ） |
+| POST | `/api/_ops/update/cancel` | 実行中ジョブの中止 |
+| POST | `/api/_ops/update/rules-check` | 公式ルールPDFの更新有無チェック（`Last-Modified` 比較） |
+| POST | `/api/_ops/update/rules-mark` | 取り込み済みバージョンの記録 |
+| POST | `/api/_ops/update/faqs` | 公式ルールQ&A（79件）の取得・更新 |
 
 **`/api/cards/search` の body パラメータ**:
 `freeword`, `freeword_field[]`, `ink_type`, `ink_color[]`, `card_type[]`,
@@ -86,7 +102,7 @@
 | 記憶 | テーブル | 中身 | 構築コスト（1回だけ） |
 |---|---|---|---|
 | カードの意味ベクトル | `card_vectors` | 2,500枚 × 256次元 | **26秒**（バッチ200枚/1.9秒） |
-| ルール条文の意味ベクトル | `rule_vectors` | 406節 × 256次元 | 6秒 |
+| ルール条文の意味ベクトル | `rule_vectors` | 463節 × 256次元 | 6秒 |
 | キーワード能力の裁定知識 | `ability_knowledge` | 13種の要約＋噛み合い＋注意点 | 2分38秒 |
 | 検証済みシナジー事例 | `synergy_memory` | 実在突合済みの高評価ペア | 探索するたびに自動蓄積 |
 
@@ -202,7 +218,9 @@
   - `abilities` (1,255) — キーワード能力（下記参照）
   - `card_refs` (227) — **効果テキストが参照する種族の前計算タグ**（自身の種族は除外）
   - `faqs` (445) — カードQ&A の参照ID
-  - `rules_sections` (406) — 公式ルール本文（表示は抜粋のみ）
+  - `rules_sections` (463) — 公式ルール本文（表示は抜粋のみ）
+  - `rule_faqs` (79) — **公式ルールQ&A（質問・回答本文つき、14カテゴリ）**
+  - `update_jobs` / `update_log` / `source_versions` — **データ更新ジョブの進捗・ログ・公式文書バージョン**
   - `meta` / `rate_limit` / `ai_rate_limit` / `ai_cache`
 
 ### テキストとルールの保存状況（実測値）
@@ -216,7 +234,8 @@
 | 能力名（`\…\` 抽出） | `cards.ability_names` | 2,500 枚に対して付与 |
 | フレーバーテキスト | `cards.flavor_text` | 1,518 枚 |
 | 全文検索用ブロブ | `cards.search_blob` | 2,500 枚（名前+版+テキスト+作家+種族+能力） |
-| 公式ルール本文 | `rules_sections.body` | 406 節 / 約 105,000 文字（総合ルール 382・プレイ修正ガイドライン 23・セットノートS1 1） |
+| 公式ルール本文 | `rules_sections.body` | 463 節（総合ルール 382・プレイ修正ガイドライン 23・**大会ルール 56**・セットノートS1 2） |
+| 公式ルールQ&A | `rule_faqs.question` / `.answer` | 79 件 / 14 カテゴリ（質問・回答の本文つき） |
 | 種族・クラス | `classifications` | 5,075 行 / 42 種 |
 | キーワード能力 | `abilities` | 1,255 行 / 13 種 |
 | 効果テキストの種族参照タグ | `card_refs` | 227 行 |
@@ -264,10 +283,14 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 AI_MODEL=gpt-5-mini
 AI_MODEL_FAST=gpt-5-nano
 ADMIN_TOKEN=任意の長い文字列        # 記憶層の構築APIを保護（未設定なら localhost のみ許可）
+ADMIN_PASSWORD=任意の長いパスワード  # 隠し管理画面のログイン用（未設定なら ADMIN_TOKEN で代替）
+ADMIN_PATH=x7f2q9                  # 任意。/_ops 以外の推測されにくいURLも受け付ける
 EOF
 
 # 記憶層（セマンティック・メモリ）を構築する場合
 npx wrangler d1 execute webapp-production --local --file=./migrations/0002_semantic_memory.sql
+# データ更新機能（隠し管理画面）を使う場合
+npx wrangler d1 execute webapp-production --local --file=./migrations/0003_data_update.sql
 # ※ `wrangler d1 migrations apply --local` はローカルDBを作り直す（＝既存データが消える）ため、
 #    ローカルでは上記のように execute で当て、消えた場合は seed_*.sql を再投入する
 npm run build && pm2 restart lorcana-fandb
@@ -292,7 +315,9 @@ UI は AI タブに案内を出し、種族逆引きなど他の機能はその�
 
 ```bash
 node scraper/test_synergy_ui.mjs   # jsdom で /synergy を実動作検証（35項目）
+node scraper/test_admin.mjs        # 隠し管理画面の秘匿性・認証・CORS分離・機能を検証（44項目）
 ```
+※ どちらもプロジェクトディレクトリ内から実行してください（jsdom の解決のため）。
 
 ## デプロイ（Cloudflare Pages）
 
@@ -302,8 +327,11 @@ npx wrangler d1 execute webapp-production --file=./migrations/0001_initial_schem
 npx wrangler d1 execute webapp-production --file=./scraper/data/seed_cards.sql
 npx wrangler d1 execute webapp-production --file=./scraper/data/seed_rules.sql
 npx wrangler d1 execute webapp-production --file=./migrations/0002_semantic_memory.sql
+npx wrangler d1 execute webapp-production --file=./migrations/0003_data_update.sql
 npx wrangler pages secret put OPENAI_API_KEY
 npx wrangler pages secret put ADMIN_TOKEN
+npx wrangler pages secret put ADMIN_PASSWORD    # 隠し管理画面のパスワード
+npx wrangler pages secret put ADMIN_PATH        # 任意（管理画面の別URL）
 npm run build && npx wrangler pages deploy dist --project-name webapp
 # デプロイ後に記憶層を1回だけ構築（/api/memory/build/* を x-admin-token 付きで叩く）
 ```
@@ -374,7 +402,7 @@ jobs:
 | 入力バリデーション | ✅ 未入力400 / 不正JSON400 / 存在しないカード404 |
 | API キーの漏洩 | ✅ HTML・JS・APIレスポンス全てで検出0件 |
 | AI未設定時のフォールバック | ✅ `/api/ai/status` が `available:false` を返すとUIが案内表示し他機能は継続動作 |
-| 記憶層の構築 | ✅ カード 2,500/2,500・ルール 406/406 ベクトル化、能力裁定 13/13 生成（`/api/memory/stats`） |
+| 記憶層の構築 | ✅ カード 2,500/2,500・ルール 463/463 ベクトル化、能力裁定 13/13 生成（`/api/memory/stats`） |
 | 記憶層あり4クエリ通し | ✅ 全て200・24.3〜30.6秒・候補120枚・`vector_search:true`。提案の約8割がベクトル由来 |
 | 経験の再利用 | ✅ 同条件2回目で `recalled:5`、提案 6→9枚に増加し上位が安定 |
 | ルール分断バグの修正効果 | ✅ 「突撃」の裁定が5条文を根拠に完成、「護衛」は2つの効果を両方正しく記述（修正前は片方を不明と回答） |
@@ -401,19 +429,91 @@ jobs:
 **副次修正**: UI自動テストのAI待機を固定8秒からポーリング（最大75秒）に変更。実応答が20〜30秒のため
 待機不足で6件が誤判定していた。
 
+## データ更新（隠し管理画面）
+
+新弾の追加やルール改定に追随するための管理画面です。**サイト内にリンクは一切なく**、
+`robots.txt` で `Disallow: /_ops`、HTML に `noindex,nofollow,noarchive,nosnippet`、
+レスポンスに `X-Robots-Tag: noindex` を付与し、ページタイトルは `maintenance` のみ。
+ナビゲーション・フッターも描画しません（共有レイアウトを使わない独立ページ）。
+
+### 開き方
+
+| 項目 | 内容 |
+|---|---|
+| URL | `/_ops`、または環境変数 `ADMIN_PATH` に設定した任意パス（例 `ADMIN_PATH=x7f2q9` → `/x7f2q9`） |
+| 認証 | `ADMIN_PASSWORD`（未設定時は `ADMIN_TOKEN` で代替）。パスワード欄のみのフォーム |
+| セッション | HMAC-SHA256 署名 Cookie `__ops_sess`（`HttpOnly; SameSite=Strict`、TTL 2時間）。鍵はパスワード自体なので**パスワードを変えると既存セッションは全て無効化**される |
+| 保護 | 定数時間比較、5回失敗で10分ロックアウト、管理APIは CORS を付与しない（同一オリジン専用） |
+
+D1 への書き込みを伴わないステートレス認証にしているため、ログイン処理でDBを消費しません。
+
+### 4つのボタン
+
+| ボタン | 動作 | 所要 |
+|---|---|---|
+| **カードデータを更新** | 公式カード検索APIを全ページ巡回し、`cards` / `classifications` / `abilities` / `card_refs` を差分更新。新規カードは名前・版・収録セットをログに表示 | 約1分（2,500枚 / 25ページ） |
+| **ルール改定をチェック** | 公式ルールPDF4文書の `Last-Modified` / `Content-Length` を取得し、取り込み済みバージョンと比較して「要更新 / 最新」を表示 | 数秒 |
+| **公式Q&Aを更新** | 公式ルールFAQページから79件のQ&A（本文つき・14カテゴリ）を取得し `rule_faqs` に差分反映 | 約2秒 |
+| **記憶層を更新** | `/api/memory/build/*` を `next_offset` に沿って自動ループ。`text_hash` 差分なので変更分のみ再ベクトル化 | 変更なしなら数秒 |
+
+上部のステータス画面に、カード枚数・ルール節数・Q&A件数・ベクトル化率（未ベクトル化があれば警告表示）・
+公式文書のバージョン一覧・直近ジョブ履歴を表示します。
+
+### カード更新の仕組み（分割ジョブ）
+
+Cloudflare Workers は1リクエストの実行時間が限られるため、25ページ×1.2秒を1回で回せません。
+そこで `update_jobs` テーブルに進捗（ページ番号・件数・状態）を持たせ、
+**1回の呼び出しで5ページ（約9秒）進めてクライアントが自動的に次を呼ぶ**方式にしました。
+
+- 途中でタブを閉じても進捗は残り、次回ログイン時に「中断したジョブを再開」ボタンが出る
+- 差分判定は公式の `modified` ではなく**主要フィールド＋効果テキストの署名比較**。
+  一致すれば書き込みを完全にスキップするため、同期済みなら2,500枚で書き込み0件
+- 変更のあったカードだけ `classifications` / `abilities` / `card_refs` を削除→再構築するので、
+  タグが減った場合も残留しない
+- リクエスト間 1,200ms + random(0,400)、直列1本、User-Agent 明示、403時はトークン再取得（BUILD_SPEC §0 遵守）
+
+### 検証結果
+
+| 項目 | 結果 |
+|---|---|
+| 全ページ巡回 | ✅ 25ページ / 2,500枚。同期済み状態では 新規0・更新0・変更なし2,500（書き込み0件） |
+| 新弾の検知（模擬） | ✅ カードを1枚削除＋1枚改変した状態で実行 → `新規1 / 更新1 / 変更なし2,498` を正しく検出し、種族3件・能力1件も再構築 |
+| 差分再ベクトル化 | ✅ 上記の2枚だけを2.5秒で再埋め込み（2,498→2,500） |
+| ルール改定検知 | ✅ `Range: bytes=0-0` の応答が **206** であることに対応。既に取り込み済みの3文書は「最新」、未取得だった大会ルールのみ「要更新」と判定 |
+| 公式Q&A取得 | ✅ 79件 / 14カテゴリを1.7秒で取得 |
+| 秘匿性・認証・CORS分離 | ✅ `node scraper/test_admin.mjs` で **44/44 パス** |
+| 既存機能への影響 | ✅ `node scraper/test_synergy_ui.mjs` **35/35 パス**（回帰なし）、存在しないパスは従来通り404 |
+
+### 副産物: 大会ルールPDFの404を解消
+
+仕様書記載の `Disney_Tournament_Rules_JP.pdf` が404だった原因は URL の変更で、
+公式ページの実リンクは **`Disney_Lorcana_Tournament_Rules_JP.pdf`** でした。
+修正して取り込み、ルール節数は **406 → 463**（大会ルール56節を追加）、ベクトルも463/463に更新済みです。
+
+### 本番で使う場合
+
+```bash
+npx wrangler d1 execute webapp-production --file=./migrations/0003_data_update.sql
+npx wrangler pages secret put ADMIN_PASSWORD
+npx wrangler pages secret put ADMIN_PATH      # 任意（URL自体を隠したい場合）
+```
+
 ## 未実装 / 既知の制約
 
-1. **大会ルールPDF** — 仕様書記載の URL が現在 404。総合ルール・プレイ修正
-   ガイドライン・セットノートS1 の 3 文書（406節）のみ取り込み済み
-2. **プレイシートPDF** — 図版中心でテキスト抽出が0節。実質的に検索対象外
-3. **カードQ&A本文** — 検索APIの `faqs` はスラッグ（例 `set1-no14-1`）のみで本文を含まず。
-   `card_qa.php` を叩いて本文を補完する処理は未実装（445件のIDのみ保持）
+1. **プレイシートPDF** — 図版中心でテキスト抽出が0節。実質的に検索対象外
+2. **カード個別Q&A本文** — 検索APIの `faqs` はスラッグ（例 `set1-no14-1`）のみで本文を含まない。
+   本文取得に使う想定だった `card_qa.php` は**現在 404**（実測）で入手経路がない。
+   代替として公式ルールFAQページから 79 件の Q&A 本文を `rule_faqs` に取り込んだ
+   （カード単位の紐付けはなし）
+3. **`rule_faqs` の AI プロンプトへの組み込み** — 未実装。取り込みは完了しているが、
+   シナジー分析の根拠として渡す処理（ベクトル化＋プロンプト注入）は次段階
 4. **デッキ→デッキコード発行** — 仕様書 §6.1 の判断通り未実装（公式の1日30回制限のため）。
    公式デッキビルダーへのリンクで代替
 5. **Lighthouse 90+** — 未計測（サンドボックス環境のため実測は未実施）
 6. **Cloudflare Pages への本番デプロイ** — 未実行（本番では `wrangler pages secret put OPENAI_API_KEY` が別途必要）
-7. **記憶層の構築は手動トリガー** — カード追加時の再ベクトル化（`text_hash` 差分）は実装済みだが、
-   自動実行する Cron は未設定。新セット追加後に `/api/memory/build/*` を1回叩く必要がある
+7. **データ更新は手動トリガー** — 隠し管理画面のボタンで実行する方式（下記「データ更新」節）。
+   自動実行する Cron は未設定。カードを追加したあとは同画面の「記憶層を更新」も押す必要がある
+   （再ベクトル化は `text_hash` 差分なので、変更分のみ数秒で完了する）
 8. **web上の情報の集積（外部知識の学習）** — 未実装。設計案は「今後の拡張案」節を参照
 9. **AI の応答は 20～40 秒** — ストリーミング未対応。スケルトン表示で待機させている
    （記憶層導入後の実測: 24.3〜31.0s、タイムアウトは 90s）

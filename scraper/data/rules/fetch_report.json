@@ -1,5 +1,5 @@
 {
-  "fetched_at": "2026-08-20T08:39:13.763Z",
+  "fetched_at": "2026-08-21T12:47:39.208Z",
   "report": [
     {
       "source": "comprehensive",
@@ -20,9 +20,10 @@
     {
       "source": "tournament",
       "label": "大会ルール",
-      "url": "https://www.takaratomy.co.jp/products/disneylorcana/common/pdf/Disney_Tournament_Rules_JP.pdf",
-      "status": 404,
-      "sections": 0
+      "url": "https://www.takaratomy.co.jp/products/disneylorcana/common/pdf/Disney_Lorcana_Tournament_Rules_JP.pdf",
+      "status": 200,
+      "bytes": 572783,
+      "sections": 57
     },
     {
       "source": "set_notes_s1",

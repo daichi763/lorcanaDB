@@ -21,7 +21,8 @@ const OUT = path.join(DATA_DIR, "rules_sections.jsonl");
 const SOURCES = [
   { source: "comprehensive", label: "総合ルール", url: `${BASE}/common/pdf/Disney-Lorcana-Comprehensive-Rules_JP.pdf` },
   { source: "guidelines", label: "プレイ修正ガイドライン", url: `${BASE}/common/pdf/Disney_Lorcana_Play_Correction_Guidelines_JP.pdf` },
-  { source: "tournament", label: "大会ルール", url: `${BASE}/common/pdf/Disney_Tournament_Rules_JP.pdf` },
+  // 旧URL Disney_Tournament_Rules_JP.pdf は 404。公式ページの実リンクは Disney_Lorcana_ 接頭辞付き。
+  { source: "tournament", label: "大会ルール", url: `${BASE}/common/pdf/Disney_Lorcana_Tournament_Rules_JP.pdf` },
   { source: "set_notes_s1", label: "セットノート S1", url: `${BASE}/common/pdf/s1_set_notes.pdf` },
   { source: "playsheet", label: "プレイシート", url: `${BASE}/common/pdf/playsheet.pdf` },
 ];

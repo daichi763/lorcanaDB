@@ -6,16 +6,43 @@ import api from './routes/api';
 import deckApi from './routes/deck';
 import aiApi from './routes/ai';
 import memoryApi from './routes/memory';
+import adminApi from './routes/admin';
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-app.use('/api/*', cors());
+/**
+ * 管理APIだけは CORS を付けない（同一オリジン専用）。
+ * cors() は既定で任意オリジンを許すため、そのまま当てると
+ * 他サイトのJSから更新APIを叩ける口を作ってしまう。
+ * 認証Cookie は SameSite=Strict なので送られはしないが、
+ * 「許可を出さない」方を既定にしておく。
+ */
+app.use('/api/*', async (c, next) => {
+  if (c.req.path.startsWith('/api/_ops')) return next();
+  return cors()(c, next);
+});
+
+/**
+ * ADMIN_PATH が設定されていれば、そのパスでも管理画面を開けるようにする。
+ * URL 自体を秘密にしたい運用（/_ops は推測されうる）のための逃げ道。
+ * ルート定義ではなくミドルウェアで先に捕まえるのは、
+ * `/:param` のような catch-all を足すと既存ページのルーティングを壊すため。
+ */
+app.use('*', async (c, next) => {
+  const want = (c.env as any).ADMIN_PATH;
+  if (want && c.req.method === 'GET' && c.req.path === `/${String(want).replace(/^\/+/, '')}`) {
+    return adminPage(c);
+  }
+  return next();
+});
+
 app.use(renderer);
 
 app.route('/api', api);
 app.route('/api/deck', deckApi);
 app.route('/api/ai', aiApi);
 app.route('/api/memory', memoryApi);
+app.route('/api/_ops', adminApi);
 
 // ============================ カード検索（トップ）============================
 app.get('/', (c) =>
@@ -550,10 +577,158 @@ app.get('/about', (c) =>
   )
 );
 
+// ============================ 隠し管理画面 ============================
+/**
+ * データ更新用の管理画面。
+ *
+ * 「普段は見つけられない場所」にするための措置:
+ *   1. nav / footer / sitemap に一切リンクを張らない
+ *   2. robots.txt で Disallow ＋ meta robots で noindex,nofollow
+ *   3. 共通レイアウト（renderer）を使わずナビも出さない
+ *   4. 未認証時はページ自体の存在を悟られにくいよう最小限の表示に留める
+ *   5. パスワード認証（ADMIN_PASSWORD）。5回失敗で10分ロック
+ *
+ * URL は既定 /_ops。推測されにくくしたい場合は環境変数 ADMIN_PATH を設定すると
+ * そのパスでも開ける（例: ADMIN_PATH=x7f2q → /x7f2q）。
+ */
+const ADMIN_HTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
+<title>maintenance</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+<main class="max-w-4xl mx-auto px-4 py-10" id="ops-root">
+
+  <!-- ログイン -->
+  <section id="op-login" class="max-w-sm mx-auto mt-10">
+    <h1 class="text-lg font-semibold mb-1"><i class="fas fa-lock mr-2 text-slate-400"></i>データ管理</h1>
+    <p class="text-xs text-slate-500 mb-5">権限のある方のみ操作できます。</p>
+    <form id="op-login-form" autocomplete="off">
+      <label class="block text-xs text-slate-400 mb-1" for="op-password">パスワード</label>
+      <input id="op-password" type="password" required autocomplete="current-password"
+        class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-sky-500">
+      <button type="submit" class="mt-3 w-full bg-sky-600 hover:bg-sky-500 rounded-lg px-4 py-2 text-sm font-medium transition">
+        認証
+      </button>
+      <div id="op-login-msg" class="text-sm text-slate-400 mt-2"></div>
+    </form>
+  </section>
+
+  <!-- 管理パネル -->
+  <section id="op-panel" class="hidden space-y-6">
+    <header class="flex items-center justify-between">
+      <h1 class="text-xl font-semibold"><i class="fas fa-database mr-2 text-sky-400"></i>データ管理</h1>
+      <div class="flex gap-2">
+        <button id="op-btn-refresh" class="text-xs px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 transition">
+          <i class="fas fa-rotate mr-1"></i>再読込
+        </button>
+        <button id="op-btn-logout" class="text-xs px-3 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 transition">
+          <i class="fas fa-right-from-bracket mr-1"></i>ログアウト
+        </button>
+      </div>
+    </header>
+
+    <!-- 現在のデータ -->
+    <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-3">現在のデータ</h2>
+      <div id="op-counts" class="grid grid-cols-3 sm:grid-cols-6 gap-2 mb-3"></div>
+      <div id="op-vectors" class="text-xs text-slate-300"></div>
+    </div>
+
+    <!-- 更新操作 -->
+    <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4 space-y-3">
+      <h2 class="text-sm font-semibold text-slate-300">更新</h2>
+
+      <div class="flex flex-wrap items-center gap-2">
+        <button id="op-btn-cards" class="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 rounded-lg px-4 py-2 text-sm font-medium transition">
+          <i class="fas fa-cloud-arrow-down mr-1"></i>カードデータを更新
+        </button>
+        <button id="op-resume" class="hidden bg-amber-600 hover:bg-amber-500 rounded-lg px-3 py-2 text-xs transition">
+          <i class="fas fa-play mr-1"></i>中断したジョブを再開
+        </button>
+        <button id="op-btn-cancel" class="hidden bg-rose-700 hover:bg-rose-600 rounded-lg px-3 py-2 text-xs transition">
+          <i class="fas fa-stop mr-1"></i>中止
+        </button>
+        <button id="op-btn-rules" class="bg-slate-700 hover:bg-slate-600 rounded-lg px-3 py-2 text-sm transition">
+          <i class="fas fa-scale-balanced mr-1"></i>ルール改定を確認
+        </button>
+        <button id="op-btn-faqs" class="bg-slate-700 hover:bg-slate-600 rounded-lg px-3 py-2 text-sm transition">
+          <i class="fas fa-circle-question mr-1"></i>公式Q&amp;Aを取得
+        </button>
+        <button id="op-btn-memory" class="bg-indigo-600 hover:bg-indigo-500 rounded-lg px-3 py-2 text-sm transition">
+          <i class="fas fa-brain mr-1"></i>記憶層を更新
+        </button>
+      </div>
+
+      <p class="text-[11px] text-slate-500 leading-relaxed">
+        公式サーバへの負荷を避けるため、1ページごとに約1.2秒の間隔を空けて直列で取得します。
+        全2,500枚（25ページ）で1分程度かかります。途中で閉じても進捗は保存され、再開できます。<br>
+        新しいカードを取り込んだあとは「記憶層を更新」を実行してください（AIが新カードを認識できるようになります）。
+      </p>
+
+      <div id="op-progress-wrap" class="hidden">
+        <div class="h-2 bg-slate-800 rounded-full overflow-hidden">
+          <div id="op-progress-bar" class="h-full bg-emerald-500 transition-all duration-300" style="width:0%"></div>
+        </div>
+        <div id="op-progress-text" class="text-xs text-slate-400 mt-1"></div>
+      </div>
+    </div>
+
+    <!-- 実行ログ -->
+    <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">実行ログ</h2>
+      <div id="op-log" class="text-xs font-mono space-y-0.5 max-h-56 overflow-y-auto"></div>
+    </div>
+
+    <!-- ルール文書の版 -->
+    <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">公式ルール文書の版</h2>
+      <div id="op-sources"></div>
+      <p class="text-[11px] text-slate-500 mt-2">
+        PDFは4MB超あり、Workers上でテキスト化できません。ここでは改定の検知のみ行います。
+        「要更新」が出た場合は開発機で <code class="text-slate-400">node scraper/fetch_rules.mjs</code> →
+        <code class="text-slate-400">node scraper/build_sql.mjs</code> を実行してください。
+      </p>
+    </div>
+
+    <!-- ジョブ履歴 -->
+    <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">ジョブ履歴</h2>
+      <div id="op-jobs" class="mb-3"></div>
+      <h2 class="text-sm font-semibold text-slate-300 mb-2">更新履歴</h2>
+      <div id="op-history" class="space-y-0.5 max-h-40 overflow-y-auto"></div>
+    </div>
+  </section>
+</main>
+<script src="/static/page-admin.js"></script>
+</body>
+</html>`;
+
+const adminPage = (c: any) => {
+  c.header('Cache-Control', 'no-store');
+  c.header('X-Robots-Tag', 'noindex, nofollow, noarchive');
+  return c.html(ADMIN_HTML);
+};
+
+app.get('/_ops', adminPage);
+
 // robots.txt（クロール方針を明示）
 app.get('/robots.txt', (c) =>
   c.text(
-    ['User-agent: *', 'Allow: /', 'Disallow: /api/', 'Crawl-delay: 2', ''].join('\n')
+    [
+      'User-agent: *',
+      'Allow: /',
+      'Disallow: /api/',
+      // 管理画面はクロール・インデックス対象外
+      'Disallow: /_ops',
+      'Crawl-delay: 2',
+      '',
+    ].join('\n')
   )
 );
 
