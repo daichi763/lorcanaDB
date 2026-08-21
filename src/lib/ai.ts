@@ -212,6 +212,14 @@ export type RetrieveOptions = {
   /** インク色をこの2色に絞る（デッキ制約） */
   restrictInk?: string[];
   limit?: number;
+  /**
+   * 事前計算した意味ベクトルによる検索結果（card_id → 類似度）。
+   * LIKE 一致は語が完全に一致しないと当たらないため、
+   * 「アグロ」「使い回す」のような言い換えはここで拾う。
+   */
+  vectorHits?: Array<{ id: number; sim: number }>;
+  /** 過去に高評価だったパートナー（記憶による加点） */
+  memoryHits?: Array<{ partner_id: number; score: number; hits: number }>;
 };
 
 /**
@@ -384,7 +392,41 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
     );
   }
 
+  // ---------- 意味ベクトルによる候補（事前計算済みの「記憶」を使う） ----------
+  // LIKE では拾えない言い換えを補うため、類似度上位のカードをプールへ加える。
+  // 類似度 0〜1 をそのままスコアに乗せる（最大 +5 程度になるよう倍率を掛ける）。
+  const vh = (o.vectorHits ?? []).filter((h) => h.id !== baseId);
+  if (vh.length) {
+    const ids = vh.map((h) => h.id);
+    const simOf = new Map(vh.map((h) => [h.id, h.sim]));
+    // D1 の SQL 変数上限（約100）に触れないよう分割して取得する
+    for (let i = 0; i < ids.length; i += 80) {
+      const chunk = ids.slice(i, i + 80);
+      const rows = await q(
+        `${BRIEF_SELECT} WHERE c.id IN (${chunk.map(() => '?').join(',')})`,
+        chunk
+      );
+      for (const r of rows) {
+        const id = Number(r.id);
+        const sim = simOf.get(id) ?? 0;
+        // 類似度が低いものは足しても雑音になるため下限を設ける
+        if (sim < 0.25) continue;
+        addToPool(pool, [r], Math.min(sim * 6, 5), `意味的に近い（類似度 ${sim.toFixed(2)}）`);
+      }
+    }
+  }
+
   await Promise.all(jobs);
+
+  // ---------- 過去の検討結果による加点（記憶） ----------
+  for (const m of o.memoryHits ?? []) {
+    const cur = pool.get(m.partner_id);
+    if (!cur) continue;
+    // 何度も選ばれているペアほど確度が高いと見なす（最大 +3）
+    cur._score += Math.min(1 + m.hits * 0.5, 3);
+    const why = `過去に高評価（${m.score}点・${m.hits}回）`;
+    if (!cur._why.includes(why)) cur._why.push(why);
+  }
 
   // ---------- フィルタ・整列 ----------
   let list = [...pool.values()].filter((c) => c.id !== baseId);
@@ -479,6 +521,23 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
 // ============================ ルール抜粋（RAG） ============================
 
 /**
+ * rules_sections の heading / body を1本の条文テキストへ復元する。
+ *
+ * ⚠ 重要: このテーブルの heading は「見出し」ではなく **本文の先頭約45文字** で、
+ * body はその続きである。例）8.8.1
+ *   heading: "突進は常在能力である。突進は「このキャラクターは、これがあなたのターンの始めから場にいたか"
+ *   body   : "のようにチャレンジできる。」という能力である。"
+ * したがって `heading] body` のように区切って連結すると文が途中で分断され、
+ * LLM が「抜粋が途切れている」と判断して推論を放棄する（精度低下の直接原因だった）。
+ * 必ず区切りなしで連結する。
+ */
+export function ruleFullText(r: Record<string, any>): string {
+  const head = String(r.heading ?? '');
+  const body = String(r.body ?? '');
+  return `${head}${body}`.replace(/\s+/g, ' ').replace(/©Disney.*$/, '').trim();
+}
+
+/**
  * 候補・起点カードに登場するキーワード能力に対応する総合ルールの本文を取得。
  * これを LLM に与えることでルール解釈のブレを抑える。
  * ※ ユーザーには返さない（§8: 全文公開はしない）。あくまで推論の根拠。
@@ -492,16 +551,18 @@ export async function fetchRuleContext(db: D1Database, terms: string[]): Promise
 
   const rows = await db
     .prepare(
+      // heading は本文前半・body は本文後半なので両方を検索対象にする
+      // （heading だけ見ると、語が45文字目以降に出てくる条文を取りこぼす）
       `SELECT section, heading, body FROM rules_sections
         WHERE source = 'comprehensive'
-          AND (${uniq.map(() => 'heading LIKE ?').join(' OR ')})
+          AND (${uniq.map(() => '(heading LIKE ? OR body LIKE ?)').join(' OR ')})
         ORDER BY CAST(section AS REAL) LIMIT 24`
     )
-    .bind(...uniq.map((t) => `%${t}%`))
+    .bind(...uniq.flatMap((t) => [`%${t}%`, `%${t}%`]))
     .all();
 
   return ((rows.results ?? []) as any[]).map(
-    (r) => `[総合ルール ${r.section} ${r.heading ?? ''}] ${String(r.body ?? '').slice(0, 900)}`
+    (r) => `[総合ルール ${r.section}] ${ruleFullText(r).slice(0, 900)}`
   );
 }
 
@@ -563,6 +624,15 @@ export function buildUserPrompt(args: {
   ruleContext: string[];
   wanted: number;
   restrictInk?: string[];
+  /** 事前要約済みのキーワード能力知識（毎回の条文RAGを置き換える固定知識） */
+  abilityKnowledge?: Array<{
+    ability: string;
+    summary: string;
+    synergy_notes: string[];
+    caveats: string[];
+  }>;
+  /** 過去に高評価だったシナジー事例（記憶の再利用） */
+  memoryNotes?: string[];
 }): string {
   const parts: string[] = [];
 
@@ -588,8 +658,28 @@ export function buildUserPrompt(args: {
     parts.push(`## インク色の制約\n候補は ${args.restrictInk.join(' / ')} に限定済み（ロルカナは1デッキ2色まで）。`);
   }
 
+  // 事前に噛み砕いた知識を先に置く。条文の生文より短く、かつ要点が整理されているため、
+  // 同じトークン量でより多くの「判断に効く情報」を渡せる。
+  if (args.abilityKnowledge?.length) {
+    const blocks = args.abilityKnowledge.map((k) => {
+      const lines = [`【${k.ability}】${k.summary}`];
+      if (k.synergy_notes.length) lines.push(`  噛み合い: ${k.synergy_notes.join(' / ')}`);
+      if (k.caveats.length) lines.push(`  注意: ${k.caveats.join(' / ')}`);
+      return lines.join('\n');
+    });
+    parts.push(
+      `## キーワード能力の裁定（公式総合ルールから事前に整理済み。これを正として扱う）\n${blocks.join('\n')}`
+    );
+  }
+
   if (args.ruleContext.length) {
     parts.push(`## 公式ルール抜粋（判断根拠。そのまま引用せず解釈に使う）\n${args.ruleContext.join('\n')}`);
+  }
+
+  if (args.memoryNotes?.length) {
+    parts.push(
+      `## 過去の検討結果（同条件で以前に高評価だった組み合わせ。妥当なら再評価し、誤りと判断すれば採用しなくてよい）\n${args.memoryNotes.join('\n')}`
+    );
   }
 
   parts.push(

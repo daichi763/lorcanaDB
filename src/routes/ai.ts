@@ -31,6 +31,15 @@ import {
   type Intent,
   type RankResult,
 } from '../lib/ai';
+import {
+  cardEmbedText,
+  embed,
+  loadAbilityKnowledge,
+  recallSynergy,
+  rememberSynergy,
+  searchCardVectors,
+  vectorsReady,
+} from '../lib/memory';
 
 const ai = new Hono<{ Bindings: Bindings }>();
 
@@ -246,6 +255,39 @@ ai.post('/synergy', async (c) => {
         .map((x) => String(x ?? '').trim())
         .filter(Boolean);
 
+    // ---- 記憶層の利用: 意味ベクトル検索（LLMを介さない高速な意味検索） ----
+    // 事前に全カードをベクトル化して D1 に保存してあるため、
+    // ここで発生するAPI呼び出しは「クエリ1本の埋め込み」だけ（実測 0.3 秒未満）。
+    let vectorHits: Array<{ id: number; sim: number }> = [];
+    let vectorUsed = false;
+    try {
+      const ready = await vectorsReady(db);
+      if (ready.cards > 0) {
+        // 起点カードの効果テキストと自由記述を1本のクエリにまとめる
+        const queryText = [
+          base ? cardEmbedText(base) : '',
+          freeText,
+          asStrings(intent.keywords).join(' '),
+        ]
+          .filter(Boolean)
+          .join(' / ');
+        if (queryText.trim()) {
+          const [qv] = await embed(c.env, [queryText], { timeoutMs: 15_000 });
+          vectorHits = await searchCardVectors(db, qv, {
+            topK: 80,
+            excludeId: base ? Number(base.id) : undefined,
+          });
+          vectorUsed = vectorHits.length > 0;
+        }
+      }
+    } catch (e: any) {
+      // ベクトル検索が落ちても従来の LIKE 検索で動作を継続する（可用性優先）
+      console.error('[VECTOR_SKIP]', String(e?.message ?? e).slice(0, 200));
+    }
+
+    // ---- 記憶層の利用: 過去の検討結果 ----
+    const memoryHits = await recallSynergy(db, base ? Number(base.id) : null, 20);
+
     const candidates: Candidate[] = await retrieveCandidates(db, {
       base,
       keywords: asStrings(intent.keywords),
@@ -254,6 +296,8 @@ ai.post('/synergy', async (c) => {
       inkColors: asStrings(intent.ink_colors),
       cardTypes: asStrings(intent.card_types),
       restrictInk,
+      vectorHits,
+      memoryHits,
       // 候補を60→120枚に拡大。実測では入力トークンが倍増しても所要時間はほぼ変わらず
       // （32.6秒 vs 34.0秒）、見落としの削減にそのまま効く。
       limit: 120,
@@ -273,7 +317,7 @@ ai.post('/synergy', async (c) => {
       });
     }
 
-    // ---- ルール抜粋（キーワード能力の正確な解釈のため） ----
+    // ---- キーワード能力の解釈（事前要約された知識を優先して使う） ----
     const kwTerms = new Set<string>();
     for (const k of String(base?.abilities ?? '').split('|')) if (k) kwTerms.add(k);
     for (const k of asStrings(intent.abilities)) kwTerms.add(k);
@@ -281,7 +325,25 @@ ai.post('/synergy', async (c) => {
     for (const cand of candidates.slice(0, 50)) {
       for (const k of String(cand.abilities ?? '').split('|')) if (k && KEYWORDS.includes(k)) kwTerms.add(k);
     }
-    const ruleContext = await fetchRuleContext(db, [...kwTerms]);
+
+    // 事前に整理済みの裁定知識があればそれを使う。
+    // 条文の生文（24節×900字）より短く要点が整理されているため、
+    // プロンプトを縮めつつ精度を上げられる。
+    const abilityKnowledge = await loadAbilityKnowledge(db, [...kwTerms]);
+    const known = new Set(abilityKnowledge.map((k) => k.ability));
+    // 知識が未生成のキーワードだけ、従来通り条文を RAG して埋める
+    const missing = [...kwTerms].filter((k) => KEYWORDS.includes(k) && !known.has(k));
+    const ruleContext = missing.length ? await fetchRuleContext(db, missing) : [];
+
+    // ---- 過去の検討結果を LLM への参考情報として渡す ----
+    const memoryById = new Map(candidates.map((x) => [Number(x.id), x]));
+    const memoryNotes = memoryHits
+      .filter((m) => memoryById.has(m.partner_id))
+      .slice(0, 8)
+      .map((m) => {
+        const card = memoryById.get(m.partner_id)!;
+        return `- #${m.partner_id} ${card.card_name}: 過去${m.score}点（${m.hits}回）${m.reason ? ` / ${m.reason.slice(0, 120)}` : ''}`;
+      });
 
     // ---- 第3段: LLM で順位付け＋理由生成 ----
     const prompt = buildUserPrompt({
@@ -291,6 +353,8 @@ ai.post('/synergy', async (c) => {
       ruleContext,
       wanted: want,
       restrictInk,
+      abilityKnowledge,
+      memoryNotes,
     });
 
     const ranked = await chatJson<RankResult>(
@@ -345,9 +409,24 @@ ai.post('/synergy', async (c) => {
       results,
       candidate_count: candidates.length,
       rule_context_count: ruleContext.length,
+      // 記憶層の利用状況（UI で「記憶を使った」と見せるため）
+      memory: {
+        vector_search: vectorUsed,
+        ability_knowledge: abilityKnowledge.length,
+        recalled: memoryNotes.length,
+      },
       model: ranked.model,
       cached: false,
     };
+
+    // ---- 記憶への書き戻し（突合済みの結果だけを蓄積）----
+    // 存在が確認できたカードのみなので、幻覚が記憶に流れ込むことはない。
+    await rememberSynergy(
+      db,
+      base ? Number(base.id) : null,
+      results.map((r) => ({ id: Number(r.card.id), score: r.score, reason: r.reason })),
+      ranked.model
+    );
 
     // ---- キャッシュ保存（失敗しても本処理は成功扱い）----
     try {

@@ -6,6 +6,8 @@ export type AiEnv = {
   AI_MODEL?: string;
   /** 自由記述→検索語の変換に使う軽量モデル */
   AI_MODEL_FAST?: string;
+  /** 記憶層の構築（ベクトル化等）を許可する管理トークン。本番では必須 */
+  ADMIN_TOKEN?: string;
 };
 
 export type Bindings = AiEnv & {

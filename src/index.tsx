@@ -5,6 +5,7 @@ import type { Bindings } from './types';
 import api from './routes/api';
 import deckApi from './routes/deck';
 import aiApi from './routes/ai';
+import memoryApi from './routes/memory';
 
 const app = new Hono<{ Bindings: Bindings }>();
 
@@ -14,6 +15,7 @@ app.use(renderer);
 app.route('/api', api);
 app.route('/api/deck', deckApi);
 app.route('/api/ai', aiApi);
+app.route('/api/memory', memoryApi);
 
 // ============================ カード検索（トップ）============================
 app.get('/', (c) =>

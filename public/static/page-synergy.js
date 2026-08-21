@@ -279,7 +279,20 @@ window.initSynergyPage = function () {
                 ${d.caveats.map((x) => `<li class="text-[11px] text-amber-100/80"><i class="fas fa-triangle-exclamation text-amber-500/80 mr-1"></i>${esc(x)}</li>`).join('')}
               </ul>`
            : ''}
-         <p class="mt-2.5 pt-2 border-t border-slate-700/70 text-[10px] text-slate-500">
+         ${(() => {
+           // 事前に構築した「記憶」のどれを使ったかを明示する（速度と精度の根拠を見せる）
+           const m = d.memory || {};
+           const tags = [];
+           if (m.vector_search) tags.push('<i class="fas fa-vector-square mr-1"></i>意味ベクトル検索');
+           if (m.ability_knowledge) tags.push(`<i class="fas fa-book-open mr-1"></i>能力裁定 ${m.ability_knowledge} 件（事前学習済み）`);
+           if (m.recalled) tags.push(`<i class="fas fa-brain mr-1"></i>過去の検討 ${m.recalled} 件を参照`);
+           return tags.length
+             ? `<div class="flex flex-wrap gap-1.5 mt-2.5 pt-2 border-t border-slate-700/70">
+                  ${tags.map((t) => `<span class="text-[10px] px-2 py-0.5 bg-emerald-950/50 border border-emerald-800/60 rounded-full text-emerald-200">${t}</span>`).join('')}
+                </div>`
+             : '';
+         })()}
+         <p class="mt-2 text-[10px] text-slate-500">
            DB候補 ${d.candidate_count} 枚から選定${d.rule_context_count ? ` / 総合ルール ${d.rule_context_count} 項目を参照` : ''}${d.model ? ` / ${esc(d.model)}` : ''}
            ${d.intent_detail && (d.intent_detail.keywords || []).length
              ? ` / 抽出語: ${d.intent_detail.keywords.map(esc).join('、')}`
@@ -312,7 +325,7 @@ window.initSynergyPage = function () {
     btn.innerHTML = '<i class="fas fa-spinner fa-spin mr-1.5"></i>探索中…';
     box.innerHTML =
       `<div class="p-4 bg-slate-900/60 border border-slate-700 rounded-lg">
-         <p class="text-xs text-slate-400 mb-3"><i class="fas fa-database mr-1"></i>候補カード120枚と総合ルールを読み込み、AIが噛み合いを検討しています（20〜60秒程度）…</p>
+         <p class="text-xs text-slate-400 mb-3"><i class="fas fa-brain mr-1"></i>記憶済みの意味ベクトルで候補120枚を選び、AIが噛み合いを検討しています（20〜40秒程度）…</p>
          <div class="space-y-2">${'<div class="h-24 skeleton rounded-lg"></div>'.repeat(4)}</div>
        </div>`;
 

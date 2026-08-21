@@ -78,13 +78,52 @@
 
 `/synergy` の「AIシナジー探索」タブ。起点カードと自由記述は**どちらか一方でも、両方でも**指定可能。
 
+### 記憶層（セマンティック・メモリ）
+
+「毎回 AI にカードとルールを読ませ直す」のをやめ、**事前計算できるものを D1 に永続化**して
+再利用する。これにより速度と精度を同時に改善している。
+
+| 記憶 | テーブル | 中身 | 構築コスト（1回だけ） |
+|---|---|---|---|
+| カードの意味ベクトル | `card_vectors` | 2,500枚 × 256次元 | **26秒**（バッチ200枚/1.9秒） |
+| ルール条文の意味ベクトル | `rule_vectors` | 406節 × 256次元 | 6秒 |
+| キーワード能力の裁定知識 | `ability_knowledge` | 13種の要約＋噛み合い＋注意点 | 2分38秒 |
+| 検証済みシナジー事例 | `synergy_memory` | 実在突合済みの高評価ペア | 探索するたびに自動蓄積 |
+
+- 埋め込みは `text-embedding-3-small` を **256次元に切り詰め**（Matryoshka 表現）。
+  1枚1KB・全体2.5MBなので、D1 から全件読んで Worker 側で内積を取れる（数ミリ秒）。
+- 検索時に発生する API 呼び出しは**クエリ1本の埋め込みだけ**（0.3秒未満）。
+  2,500枚との突き合わせは LLM を一切経由しない。
+- `text_hash`（SHA-256）で差分管理。カードテキストが変わった行だけ再計算する。
+- ベクトルが未投入でも**従来の LIKE 検索で動作し続ける**（記憶層は加点として作用）。
+
+#### 効果
+
+| 観点 | 従来 | 記憶層あり |
+|---|---|---|
+| 言い換えへの追従 | LIKE 一致のみ。「使い回す」「アグロ」等で候補0件になることがあった | 意味ベクトルで拾える。提案の**約8割がベクトル由来** |
+| ルール知識の渡し方 | 生条文を毎回 24節 × 900字 RAG（5,694文字） | 事前要約 6件（4,005文字）＝**30%削減**、かつ内容は要点整理済み |
+| 回答の安定性 | 同一条件でも毎回ゆれる | 過去の高評価ペアを参照。2回目は上位が安定し提案数も 6→9 枚に増加 |
+| 所要時間 | 24〜40秒 | 24〜31秒（ルール部分の短縮分だけ改善） |
+
+#### 記憶の構築・点検 API
+
+いずれも書き込み系は `ADMIN_TOKEN`（`x-admin-token` ヘッダ）必須。未設定時は localhost のみ許可。
+
+| メソッド | パス | 用途 |
+|---|---|---|
+| GET | `/api/memory/stats` | 記憶の充填状況（ベクトル化件数など） |
+| POST | `/api/memory/build/cards` | カードのベクトル化（`{batch, offset, force}` で分割実行） |
+| POST | `/api/memory/build/rules` | ルール条文のベクトル化 |
+| POST | `/api/memory/build/abilities` | キーワード能力の裁定知識を生成 |
+
 ### 処理フロー（4段構成）
 
 | 段 | 内容 | 実装 |
 |---|---|---|
 | 1. 意図抽出 | 自由記述を検索語（keywords / 種族 / 能力 / インク色 / 種別）に分解 | `gpt-5-nano` (reasoning: minimal) |
 | 2. 候補抽出 | **D1 上の決定的な SQL** で最大 120 枚に絞る（名前指名・種族参照・同系メカニクス等を加点し、不足分は指定条件で段階的に補充） | `src/lib/ai.ts` |
-| 3. 順位付け | 候補＋**総合ルールの該当条文（最大24節×900字）**を渡してスコアと理由を生成 | `gpt-5-mini` (reasoning: low) |
+| 3. 順位付け | 候補＋**事前要約済みの能力裁定（`ability_knowledge`）**を渡してスコアと理由を生成。要約が無い能力に限り生条文 RAG（最大24節×900字）で補う | `gpt-5-mini` (reasoning: low) |
 | 4. 突合 | LLM が返した `id` を D1 の実データに突合し、**存在しないカードを破棄** | `src/routes/ai.ts` |
 
 ### 1回あたりの入力量（トークン予算）
@@ -117,7 +156,15 @@
   「色＋種類＋種族」→「色＋種類」→「色のみ」の順に緩めて 120 枚まで埋める
   （インク2色固定指定時はその制約を破る補充はしない）
 - **外部知識を使わせない**。プロンプトには DB の効果テキストと総合ルールの抜粹のみを入れ、
-  キーワード能力（13種）の解釈は常に `rules_sections` から RAG で供給する
+  キーワード能力（13種）の解釈は `ability_knowledge`（同じ `rules_sections` から事前生成）
+  または生条文 RAG で供給する。そのためレスポンスの `rule_context_count` は
+  **要約が揃っている状態では通常 0**（要約で足りたことを意味し、ルールを無視した訳ではない）
+- **`rules_sections.heading` は「見出し」ではない**（重要な落とし穴）。
+  実データは `heading` = 本文の先頭約45文字、`body` = その続き、という分割になっている。
+  旧実装は `[section heading] body` の形で連結していたため**文が途中で分断**され、
+  LLM が「抜粋が途切れている」と判断して推論を放棄していた（精度が低かった直接原因）。
+  現在は `ruleFullText()` で区切り文字なしに復元し、`©Disney` 以降を除去してから渡す。
+  検索も `heading` / `body` の両カラムを対象にし、`8.x.` の兄弟条文まで拾う
 - **幻覚カードは表示されない**。候補集外の `id` は全て破棄される
 - **ルール本文はユーザーに返さない**。RAG で参照するのは推論根拠としてのみ（BUILD_SPEC §8 を維持）
 - **API キーはサーバ側のみ**。`.dev.vars`（ローカル）/ `wrangler secret`（本番）に保持し、
@@ -216,7 +263,21 @@ OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.openai.com/v1
 AI_MODEL=gpt-5-mini
 AI_MODEL_FAST=gpt-5-nano
+ADMIN_TOKEN=任意の長い文字列        # 記憶層の構築APIを保護（未設定なら localhost のみ許可）
 EOF
+
+# 記憶層（セマンティック・メモリ）を構築する場合
+npx wrangler d1 execute webapp-production --local --file=./migrations/0002_semantic_memory.sql
+# ※ `wrangler d1 migrations apply --local` はローカルDBを作り直す（＝既存データが消える）ため、
+#    ローカルでは上記のように execute で当て、消えた場合は seed_*.sql を再投入する
+npm run build && pm2 restart lorcana-fandb
+for i in 0 200 400 600 800 1000 1200 1400 1600 1800 2000 2200 2400; do
+  curl -s -XPOST localhost:3000/api/memory/build/cards -H 'content-type: application/json' \
+    -d "{\"batch\":200,\"offset\":$i}" >/dev/null
+done
+curl -s -XPOST localhost:3000/api/memory/build/rules -d '{}'
+curl -s -XPOST localhost:3000/api/memory/build/abilities -d '{}'   # 約2分40秒
+curl -s localhost:3000/api/memory/stats
 
 npm run build
 pm2 start ecosystem.config.cjs
@@ -240,7 +301,11 @@ npx wrangler d1 create webapp-production          # 発行された database_id 
 npx wrangler d1 execute webapp-production --file=./migrations/0001_initial_schema.sql
 npx wrangler d1 execute webapp-production --file=./scraper/data/seed_cards.sql
 npx wrangler d1 execute webapp-production --file=./scraper/data/seed_rules.sql
+npx wrangler d1 execute webapp-production --file=./migrations/0002_semantic_memory.sql
+npx wrangler pages secret put OPENAI_API_KEY
+npx wrangler pages secret put ADMIN_TOKEN
 npm run build && npx wrangler pages deploy dist --project-name webapp
+# デプロイ後に記憶層を1回だけ構築（/api/memory/build/* を x-admin-token 付きで叩く）
 ```
 
 差分更新の Cron 例（GitHub Actions、夜間バッチ）:
@@ -309,6 +374,10 @@ jobs:
 | 入力バリデーション | ✅ 未入力400 / 不正JSON400 / 存在しないカード404 |
 | API キーの漏洩 | ✅ HTML・JS・APIレスポンス全てで検出0件 |
 | AI未設定時のフォールバック | ✅ `/api/ai/status` が `available:false` を返すとUIが案内表示し他機能は継続動作 |
+| 記憶層の構築 | ✅ カード 2,500/2,500・ルール 406/406 ベクトル化、能力裁定 13/13 生成（`/api/memory/stats`） |
+| 記憶層あり4クエリ通し | ✅ 全て200・24.3〜30.6秒・候補120枚・`vector_search:true`。提案の約8割がベクトル由来 |
+| 経験の再利用 | ✅ 同条件2回目で `recalled:5`、提案 6→9枚に増加し上位が安定 |
+| ルール分断バグの修正効果 | ✅ 「突撃」の裁定が5条文を根拠に完成、「護衛」は2つの効果を両方正しく記述（修正前は片方を不明と回答） |
 | UI 自動テスト（jsdom） | ✅ **35/35 パス**（`node scraper/test_synergy_ui.mjs`） |
 
 ### 修正済み不具合: AI検索で「サーバー内部エラー」(HTTP 500)
@@ -343,11 +412,49 @@ jobs:
    公式デッキビルダーへのリンクで代替
 5. **Lighthouse 90+** — 未計測（サンドボックス環境のため実測は未実施）
 6. **Cloudflare Pages への本番デプロイ** — 未実行（本番では `wrangler pages secret put OPENAI_API_KEY` が別途必要）
-7. **AI 探索の候補抽出** — ベクトル検索（embedding）でなく LIKE ＋ルールベースのスコアリング。
-   語彙が一致しない言い回しには弱い（例: 「ビートダウン」のようなスラング）。
-   現在は補充段で 120 枚まで埋めて「0件」は回避しているが、補充分の関連度は LLM 側の判断に任せている
-8. **AI の応答は 20～60 秒** — ストリーミング未対応。スケルトン表示で待機させている
-   （候補120枚化後の実測: 23.9〜38.2s、タイムアウトは 90s）
+7. **記憶層の構築は手動トリガー** — カード追加時の再ベクトル化（`text_hash` 差分）は実装済みだが、
+   自動実行する Cron は未設定。新セット追加後に `/api/memory/build/*` を1回叩く必要がある
+8. **web上の情報の集積（外部知識の学習）** — 未実装。設計案は「今後の拡張案」節を参照
+9. **AI の応答は 20～40 秒** — ストリーミング未対応。スケルトン表示で待機させている
+   （記憶層導入後の実測: 24.3〜31.0s、タイムアウトは 90s）
+
+## 今後の拡張案: web上の情報を集積してシナジー分析に活かす（未実装）
+
+現行の記憶層は「公式データ（カード・総合ルール）＋自前の検討履歴」だけで閉じている。
+これを web 上の情報（大会入賞デッキ、環境記事、コミュニティの議論）まで広げる構想は
+**技術的には現行アーキテクチャの上に無理なく載る**。想定設計は以下。
+
+### 実現方式
+
+| 層 | 内容 | 実装先 |
+|---|---|---|
+| 収集 | 公式デッキリスト／大会結果ページを日次クロール。robots.txt と利用規約を尊重し、取得元・取得日時を必ず記録 | GitHub Actions（Cron）。Workers では長時間処理ができないためサンドボックス外で実行 |
+| 正規化 | HTML → カード名の配列に還元し、既存 `cards` に**名前突合**。突合できなかった行は捨てる（表記ゆれの混入防止） | scraper 側の Node スクリプト |
+| 統計化 | 「同一デッキに同居した回数」「共起リフト値」を集計。テキストは保存せず**数値だけ**を D1 に入れる | 新テーブル `cooccurrence(card_a, card_b, decks, lift, window)` |
+| 活用 | 候補抽出の加点（現行の `synergy_memory` ボーナスと同じ枠）＋プロンプトに「実戦での共起上位」として数行渡す | `src/lib/ai.ts` / `src/routes/ai.ts` を数十行修正するだけ |
+
+### なぜ現行設計にそのまま載るか
+
+- 候補抽出は既に「複数シグナルの加点プール」構造（LIKE / 種族参照 / メカニクス / ベクトル / 過去の高評価）。
+  共起統計は**6本目のシグナルを足すだけ**で済む。
+- 記憶層のテーブル設計（`text_hash` 差分・ベクトルBLOB）を流用できるため、
+  記事本文を要約してベクトル化する拡張も同じパターンで足せる。
+- 失敗時は無視して従来動作に落ちる「可用性優先」の作りになっているので、収集が止まっても機能は死なない。
+
+### 注意すべき制約（先に決めておくべきこと）
+
+1. **著作権・利用規約**。記事本文やブログの文章をそのまま D1 に溜めて再配布するのは避ける。
+   安全なのは「カード名の共起という事実（数値）」までに絞ること。要約を保存する場合は
+   出典URLを必ず併記し、UI では引用ではなくリンクで示す。
+2. **ノイズの質**。個人ブログの主張は誤りを含む。**統計（共起・勝率）は強いが、文章による主張は弱い**
+   という重み付けが必要。文章を根拠にするなら「公式Q&A > 大会データ > 記事」の階層を明示する。
+3. **環境の陳腐化**。1年前の共起は現環境では有害。集計に `window`（直近90日など）を持たせ、
+   古いデータは減衰させる。
+4. **クロール負荷**。日次・低頻度・User-Agent 明示・失敗時は指数バックオフ。
+   Cloudflare Workers 側からは叩かず、Actions 側で完結させる。
+
+**工数の目安**: 収集＋正規化に 1〜2日、共起集計と加点統合に半日、UI の出典表示に半日。
+最初は「公式が公開している大会入賞デッキのみ」に絞るのが安全かつ効果が大きい。
 
 ## 推奨される次のステップ
 
