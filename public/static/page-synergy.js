@@ -286,6 +286,7 @@ window.initSynergyPage = function () {
            if (m.vector_search) tags.push('<i class="fas fa-vector-square mr-1"></i>意味ベクトル検索');
            if (m.ability_knowledge) tags.push(`<i class="fas fa-book-open mr-1"></i>能力裁定 ${m.ability_knowledge} 件（事前学習済み）`);
            if (m.recalled) tags.push(`<i class="fas fa-brain mr-1"></i>過去の検討 ${m.recalled} 件を参照`);
+           if (m.official_faqs) tags.push(`<i class="fas fa-circle-question mr-1"></i>公式Q&amp;A ${m.official_faqs} 件を根拠に`);
            return tags.length
              ? `<div class="flex flex-wrap gap-1.5 mt-2.5 pt-2 border-t border-slate-700/70">
                   ${tags.map((t) => `<span class="text-[10px] px-2 py-0.5 bg-emerald-950/50 border border-emerald-800/60 rounded-full text-emerald-200">${t}</span>`).join('')}
@@ -300,13 +301,36 @@ window.initSynergyPage = function () {
          </p>
        </div>`;
 
+    // 推論の根拠に使った公式Q&Aを開閉で提示する。
+    // 「なぜこの判断なのか」をユーザーが公式情報で検証できるようにする。
+    const faqBlock = (d.official_faqs || []).length
+      ? `<details class="mt-3 bg-slate-900/60 border border-slate-700/70 rounded-lg">
+           <summary class="cursor-pointer px-3 py-2 text-[12px] text-slate-300 hover:text-slate-100">
+             <i class="fas fa-circle-question text-sky-300 mr-1.5"></i>参照した公式Q&amp;A
+             <span class="text-slate-500">${d.official_faqs.length} 件</span>
+           </summary>
+           <div class="px-3 pb-3 space-y-2">
+             ${d.official_faqs
+               .map(
+                 (f) => `<div class="text-[11px] leading-relaxed border-l-2 border-sky-800/70 pl-2">
+                   <div class="text-slate-200"><span class="text-[10px] px-1.5 py-0.5 bg-slate-800 rounded text-slate-400 mr-1">${esc(f.category || '')}</span>Q. ${esc(f.question || '')}</div>
+                   <div class="text-slate-400 mt-0.5">A. ${esc(f.answer || '')}</div>
+                 </div>`
+               )
+               .join('')}
+           </div>
+           <p class="px-3 pb-2 text-[10px] text-slate-500">出典: タカラトミー公式サイトのルールQ&amp;A</p>
+         </details>`
+      : '';
+
     box.innerHTML =
       head +
       `<h3 class="text-sm font-bold mb-2">
          <i class="fas fa-list-ol text-sky-300 mr-1.5"></i>シナジー候補
          <span class="text-xs font-normal text-slate-500">${d.results.length} 枚</span>
        </h3>
-       <div class="space-y-2">${d.results.map((r, i) => aiResultCard(r, i + 1)).join('')}</div>`;
+       <div class="space-y-2">${d.results.map((r, i) => aiResultCard(r, i + 1)).join('')}</div>` +
+      faqBlock;
   }
 
   async function runAi() {

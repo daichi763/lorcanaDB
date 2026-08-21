@@ -161,6 +161,18 @@ export function ruleEmbedText(r: Record<string, any>): string {
   return `[総合ルール ${r.section ?? ''}] ${ruleFullText(r)}`.slice(0, 1200);
 }
 
+/**
+ * 公式Q&A 1件を検索用テキストへ。
+ * 質問文だけだと「〜できますか？」ばかりで似通ってしまうため、
+ * カテゴリ・質問・回答を1本にまとめて埋め込む。
+ */
+export function faqEmbedText(f: Record<string, any>): string {
+  const q = String(f.question ?? '').replace(/\s+/g, ' ');
+  const a = String(f.answer ?? '').replace(/\s+/g, ' ');
+  const note = String(f.note ?? '').replace(/\s+/g, ' ');
+  return `[公式Q&A ${f.category ?? ''}] Q: ${q} A: ${a}${note ? ` (${note})` : ''}`.slice(0, 1200);
+}
+
 // ============================ ベクトル検索 ============================
 
 export type VecHit = { id: number; sim: number };
@@ -216,14 +228,103 @@ export async function searchRuleVectors(
   return hits.slice(0, topK);
 }
 
-/** ベクトルが投入済みかどうか（未投入なら従来の LIKE 検索のみで動く） */
-export async function vectorsReady(db: D1Database): Promise<{ cards: number; rules: number }> {
+export async function searchFaqVectors(
+  db: D1Database,
+  query: Float32Array,
+  opts: { topK?: number } = {}
+): Promise<VecHit[]> {
+  const topK = opts.topK ?? 6;
   try {
-    const a = await db.prepare('SELECT COUNT(*) AS n FROM card_vectors').first<{ n: number }>();
-    const b = await db.prepare('SELECT COUNT(*) AS n FROM rule_vectors').first<{ n: number }>();
-    return { cards: Number(a?.n ?? 0), rules: Number(b?.n ?? 0) };
+    const rows = await db.prepare('SELECT faq_id, vec FROM faq_vectors').all();
+    const list = (rows.results ?? []) as any[];
+    if (!list.length) return [];
+
+    const q = normalize(query);
+    const hits: VecHit[] = [];
+    for (const r of list) {
+      const v = fromBlob(r.vec);
+      if (!v) continue;
+      hits.push({ id: Number(r.faq_id), sim: dot(q, v) });
+    }
+    hits.sort((a, b) => b.sim - a.sim);
+    return hits.slice(0, topK);
   } catch {
-    return { cards: 0, rules: 0 };
+    // マイグレーション未適用でも AI 探索を止めない
+    return [];
+  }
+}
+
+/** ベクトルが投入済みかどうか（未投入なら従来の LIKE 検索のみで動く） */
+export async function vectorsReady(
+  db: D1Database
+): Promise<{ cards: number; rules: number; faqs: number }> {
+  const count = async (sql: string) => {
+    try {
+      const r = await db.prepare(sql).first<{ n: number }>();
+      return Number(r?.n ?? 0);
+    } catch {
+      return 0;
+    }
+  };
+  return {
+    cards: await count('SELECT COUNT(*) AS n FROM card_vectors'),
+    rules: await count('SELECT COUNT(*) AS n FROM rule_vectors'),
+    faqs: await count('SELECT COUNT(*) AS n FROM faq_vectors'),
+  };
+}
+
+// ============================ 公式Q&A の想起 ============================
+
+export type FaqHit = {
+  id: number;
+  category: string;
+  question: string;
+  answer: string;
+  note: string;
+  sim: number;
+};
+
+/**
+ * クエリベクトルに意味的に近い公式Q&Aを取り出す。
+ *
+ * 公式Q&Aは総合ルールの条文より具体的（「インクに置けるのはどのカードか」等）で、
+ * 短い（Q42字/A87字）ため、上位数件を丸ごとプロンプトに載せてもトークン負荷が小さい。
+ * 類似度が低いものを混ぜると誤誘導になるため minSim で足切りする。
+ */
+export async function recallFaqs(
+  db: D1Database,
+  query: Float32Array,
+  opts: { topK?: number; minSim?: number } = {}
+): Promise<FaqHit[]> {
+  const topK = opts.topK ?? 6;
+  const minSim = opts.minSim ?? 0.28;
+  const hits = (await searchFaqVectors(db, query, { topK: topK * 2 })).filter(
+    (h) => h.sim >= minSim
+  );
+  if (!hits.length) return [];
+
+  const ids = hits.slice(0, topK).map((h) => h.id);
+  const simById = new Map(hits.map((h) => [h.id, h.sim]));
+  try {
+    const rows = await db
+      .prepare(
+        `SELECT id, category, question, answer, note FROM rule_faqs
+          WHERE id IN (${ids.map(() => '?').join(',')})`
+      )
+      .bind(...ids)
+      .all();
+    return ((rows.results ?? []) as any[])
+      .map((r) => ({
+        id: Number(r.id),
+        category: String(r.category ?? ''),
+        question: String(r.question ?? ''),
+        answer: String(r.answer ?? ''),
+        note: String(r.note ?? ''),
+        sim: simById.get(Number(r.id)) ?? 0,
+      }))
+      .sort((a, b) => b.sim - a.sim);
+  } catch {
+    return [];
   }
 }
 

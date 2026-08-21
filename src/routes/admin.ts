@@ -236,6 +236,8 @@ admin.get('/status', async (c) => {
   const vectors = await q<any>(`
     SELECT (SELECT COUNT(*) FROM card_vectors) AS cards,
            (SELECT COUNT(*) FROM rule_vectors) AS rules`);
+  // faq_vectors はマイグレーション0004。未適用環境でも status を落とさないため個別に取る
+  const faqVec = await q<{ n: number }>('SELECT COUNT(*) AS n FROM faq_vectors');
   const latestSet = await q<any>(
     'SELECT sets_name, sets_order, COUNT(*) AS n FROM cards GROUP BY sets_name ORDER BY sets_order DESC LIMIT 1'
   );
@@ -246,7 +248,7 @@ admin.get('/status', async (c) => {
 
   return c.json({
     counts: { ...(counts ?? {}), rule_faqs: Number(ruleFaqs?.n ?? 0) },
-    vectors: vectors ?? {},
+    vectors: { ...(vectors ?? {}), faqs: Number(faqVec?.n ?? 0) },
     latest_set: latestSet ?? null,
     meta: Object.fromEntries(meta.map((m) => [m.key, m.value])),
     jobs,

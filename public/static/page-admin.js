@@ -107,13 +107,17 @@
 
     const vecCards = Number(v.cards ?? 0);
     const vecRules = Number(v.rules ?? 0);
+    const vecFaqs = Number(v.faqs ?? 0);
     const needCards = Number(c.cards ?? 0) - vecCards;
     const needRules = Number(c.rules ?? 0) - vecRules;
+    const needFaqs = Number(c.rule_faqs ?? 0) - vecFaqs;
+    const needAll = Math.max(0, needCards) + Math.max(0, needRules) + Math.max(0, needFaqs);
     $('op-vectors').innerHTML = `
       <div>意味ベクトル: カード <b class="${needCards > 0 ? 'text-amber-300' : 'text-emerald-300'}">${vecCards.toLocaleString()}</b> / ${Number(c.cards ?? 0).toLocaleString()}
-      ・ルール <b class="${needRules > 0 ? 'text-amber-300' : 'text-emerald-300'}">${vecRules.toLocaleString()}</b> / ${Number(c.rules ?? 0).toLocaleString()}</div>
-      ${needCards > 0 || needRules > 0
-        ? `<div class="text-amber-300 mt-1"><i class="fas fa-triangle-exclamation mr-1"></i>未ベクトル化 ${Math.max(0, needCards) + Math.max(0, needRules)} 件。AI分析の精度を保つため「記憶層を更新」を実行してください。</div>`
+      ・ルール <b class="${needRules > 0 ? 'text-amber-300' : 'text-emerald-300'}">${vecRules.toLocaleString()}</b> / ${Number(c.rules ?? 0).toLocaleString()}
+      ・公式Q&A <b class="${needFaqs > 0 ? 'text-amber-300' : 'text-emerald-300'}">${vecFaqs.toLocaleString()}</b> / ${Number(c.rule_faqs ?? 0).toLocaleString()}</div>
+      ${needAll > 0
+        ? `<div class="text-amber-300 mt-1"><i class="fas fa-triangle-exclamation mr-1"></i>未ベクトル化 ${needAll} 件。AI分析の精度を保つため「記憶層を更新」を実行してください。</div>`
         : '<div class="text-emerald-300 mt-1"><i class="fas fa-check mr-1"></i>記憶層は最新です</div>'}
       <div class="text-slate-400 mt-1">最新セット: ${set ? esc(set.sets_name) + ` (${set.n}枚)` : '—'}
         ／ 最終取込: ${esc(meta.updated_at || meta.imported_at || '—')}</div>`;
@@ -318,6 +322,26 @@
         rOffset = rr.next_offset;
       }
       pushLog(`ルール条文の記憶を更新: ${rProcessed} 件`, 'ok');
+
+      // 公式Q&A（rule_faqs）も意味ベクトル化する。AI分析で「公式の見解」として
+      // 最優先の根拠に使うため、Q&Aを更新したらここも回す必要がある。
+      let fOffset = 0;
+      let fProcessed = 0;
+      let fGuard = 0;
+      while (fGuard++ < 20) {
+        const fr = await fetch('/api/memory/build/faqs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ batch: 200, offset: fOffset }),
+        }).then((x) => x.json());
+        if (fr.error) throw new Error(fr.detail || fr.error);
+        fProcessed += fr.processed || 0;
+        setProgress(98, `公式Q&Aを記憶中... 更新 ${fProcessed}`);
+        if (fr.done || fr.next_offset == null) break;
+        fOffset = fr.next_offset;
+      }
+      pushLog(`公式Q&Aの記憶を更新: ${fProcessed} 件`, 'ok');
       setProgress(100, '記憶層の更新が完了しました');
     } catch (e) {
       pushLog(`記憶層の更新に失敗: ${e.message}`, 'error');

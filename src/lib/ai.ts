@@ -600,7 +600,9 @@ export const SYSTEM_PROMPT = `あなたはトレーディングカードゲー�
 
 ## 厳守事項
 1. 提示された「候補カード一覧」に含まれる #ID のカードだけを選ぶ。一覧に無いカードを創作してはならない。
-2. 判断根拠は、提示された効果テキストと「公式ルール抜粋」のみ。曖昧な場合は断定せず「〜と思われる」等と書く。
+2. 判断根拠は、提示された効果テキストと「公式ルール抜粋」「公式Q&A」のみ。曖昧な場合は断定せず「〜と思われる」等と書く。
+   根拠の強さは 公式Q&A ＞ キーワード能力の裁定 ＞ 公式ルール抜粋 ＞ 自分の推論 の順。
+   公式Q&Aに反する提案はしない。反する可能性がある場合は caveats に明記する。
 3. reason は日本語で、その2枚（または起点条件）が具体的にどう噛み合うかを1〜2文で説明する。
    悪い例:「強いカードです」 良い例:「起点の〈支援〉で攻撃力を渡す先として、耐久を持つこのキャラが場に残りやすい」
 4. score は 0〜100 の整数。実際に一緒に使う価値がある度合い。無理のある組み合わせは低く付ける。
@@ -633,6 +635,8 @@ export function buildUserPrompt(args: {
   }>;
   /** 過去に高評価だったシナジー事例（記憶の再利用） */
   memoryNotes?: string[];
+  /** 意味検索で想起した公式ルールQ&A（公式の公式見解＝最優先の根拠） */
+  faqs?: Array<{ category: string; question: string; answer: string; note?: string }>;
 }): string {
   const parts: string[] = [];
 
@@ -674,6 +678,25 @@ export function buildUserPrompt(args: {
 
   if (args.ruleContext.length) {
     parts.push(`## 公式ルール抜粋（判断根拠。そのまま引用せず解釈に使う）\n${args.ruleContext.join('\n')}`);
+  }
+
+  // 公式Q&A は「公式が明言した見解」。条文の解釈より強い根拠なので、
+  // プロンプト上でも優先度を明示して条文抜粋の直後に置く。
+  if (args.faqs?.length) {
+    const lines = args.faqs.map(
+      (f) =>
+        `- [${f.category}] Q: ${String(f.question).replace(/\s+/g, ' ').slice(0, 200)}\n  A: ${String(
+          f.answer
+        )
+          .replace(/\s+/g, ' ')
+          .slice(0, 400)}${f.note ? `（${String(f.note).slice(0, 120)}）` : ''}`
+    );
+    parts.push(
+      `## 公式Q&A（ユーザーの相談に関連するものを抽出。**公式の見解なので推論より優先する**）
+提案がこの見解と矛盾する場合は推薦しないか、矛盾を caveats に明記する。関連がない項目は無視してよい。\n${lines.join(
+        '\n'
+      )}`
+    );
   }
 
   if (args.memoryNotes?.length) {

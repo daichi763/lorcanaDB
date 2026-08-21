@@ -75,6 +75,8 @@
 | POST | `/api/_ops/update/rules-mark` | 取り込み済みバージョンの記録 |
 | POST | `/api/_ops/update/faqs` | 公式ルールQ&A（79件）の取得・更新 |
 
+**記憶層API（`/api/memory/*`）**: `GET /stats`、`POST /build/cards`、`POST /build/rules`、`POST /build/faqs`、`POST /build/abilities`（いずれも `ADMIN_TOKEN` 必須）
+
 **`/api/cards/search` の body パラメータ**:
 `freeword`, `freeword_field[]`, `ink_type`, `ink_color[]`, `card_type[]`,
 `classification[]`, `classification_mode`(`and`/`or`), `rarity[]`, `ability[]`,
@@ -103,6 +105,7 @@
 |---|---|---|---|
 | カードの意味ベクトル | `card_vectors` | 2,500枚 × 256次元 | **26秒**（バッチ200枚/1.9秒） |
 | ルール条文の意味ベクトル | `rule_vectors` | 463節 × 256次元 | 6秒 |
+| **公式Q&Aの意味ベクトル** | **`faq_vectors`** | **79件 × 256次元（公式の見解）** | **2秒** |
 | キーワード能力の裁定知識 | `ability_knowledge` | 13種の要約＋噛み合い＋注意点 | 2分38秒 |
 | 検証済みシナジー事例 | `synergy_memory` | 実在突合済みの高評価ペア | 探索するたびに自動蓄積 |
 
@@ -132,6 +135,36 @@
 | POST | `/api/memory/build/cards` | カードのベクトル化（`{batch, offset, force}` で分割実行） |
 | POST | `/api/memory/build/rules` | ルール条文のベクトル化 |
 | POST | `/api/memory/build/abilities` | キーワード能力の裁定知識を生成 |
+
+### 公式Q&A（79件）を判断根拠に使う
+
+公式サイトのルールQ&A 79件（14カテゴリ）を `rule_faqs` に取り込み、`faq_vectors` として
+意味ベクトル化して AI 分析のプロンプトに載せている。
+
+- **なぜ条文と別に持つか**: 総合ルールの条文は抽象的（「インクウェルは…」）だが、
+  公式Q&Aは**実際に聞かれた具体的な状況とその公式回答**（「インクは毎ターン置かないといけないのですか？」）。
+  デッキ構築の可否判断に直接効く情報が多い
+- **想起の方法**: カード検索に使うクエリベクトルを**そのまま流用**するため、
+  追加の API 呼び出しは発生しない（応答時間は変わらない）
+- **足切り**: 類似度 0.28 未満は捨て、上位6件のみ渡す。無関係なQ&Aを載せると
+  かえって誤誘導になるため
+- **プロンプト上の優先順位**: システムプロンプトで
+  **公式Q&A ＞ キーワード能力の裁定 ＞ 公式ルール抜粋 ＞ 自分の推論** と明示し、
+  Q&Aに反する提案をしない／反する可能性があれば `caveats` に書くよう指示
+- **UIへの提示**: 応答に `official_faqs`（カテゴリ・質問・回答・類似度）を含め、
+  シナジー画面に「参照した公式Q&A」の開閉ブロックと記憶バッジを表示。
+  ユーザーが AI の判断根拠を公式情報で検証できる
+
+#### 検証結果（`node scraper/test_faq_memory.mjs` → 33/33 パス）
+
+| 項目 | 結果 |
+|---|---|
+| ベクトル化 | ✅ 79/79 件。差分再実行は書き込み0件（`text_hash` 一致でスキップ） |
+| 想起の妥当性 | ✅ 「インク加速」→ インクカテゴリのQ&Aが首位(0.64)、「歌でアクションを無料」→ 歌のコスト軽減Q&Aが首位(0.61)、「チャレンジで倒す」→ チャレンジQ&Aが首位(0.65) |
+| 低類似の混入 | ✅ 返却された全件が 0.53 以上（足切りが機能） |
+| 応答への反映 | ✅ 実応答の `caveats` に「インクは毎ターン置かなくてよい」「コスト軽減の重複」といったQ&A由来の注意点が出力された |
+| 記憶更新への統合 | ✅ 管理画面の「記憶層を更新」がQ&Aもベクトル化。ステータスにQ&Aベクトル数を表示 |
+| 既存機能への影響 | ✅ `test_synergy_ui.mjs` 35/35・`test_admin.mjs` 44/44 パス（回帰なし） |
 
 ### 処理フロー（4段構成）
 
@@ -291,6 +324,7 @@ EOF
 npx wrangler d1 execute webapp-production --local --file=./migrations/0002_semantic_memory.sql
 # データ更新機能（隠し管理画面）を使う場合
 npx wrangler d1 execute webapp-production --local --file=./migrations/0003_data_update.sql
+npx wrangler d1 execute webapp-production --local --file=./migrations/0004_faq_memory.sql
 # ※ `wrangler d1 migrations apply --local` はローカルDBを作り直す（＝既存データが消える）ため、
 #    ローカルでは上記のように execute で当て、消えた場合は seed_*.sql を再投入する
 npm run build && pm2 restart lorcana-fandb
@@ -299,6 +333,7 @@ for i in 0 200 400 600 800 1000 1200 1400 1600 1800 2000 2200 2400; do
     -d "{\"batch\":200,\"offset\":$i}" >/dev/null
 done
 curl -s -XPOST localhost:3000/api/memory/build/rules -d '{}'
+curl -s -XPOST localhost:3000/api/memory/build/faqs -d '{}'    # 公式Q&A 79件（約2秒）
 curl -s -XPOST localhost:3000/api/memory/build/abilities -d '{}'   # 約2分40秒
 curl -s localhost:3000/api/memory/stats
 
@@ -316,6 +351,7 @@ UI は AI タブに案内を出し、種族逆引きなど他の機能はその�
 ```bash
 node scraper/test_synergy_ui.mjs   # jsdom で /synergy を実動作検証（35項目）
 node scraper/test_admin.mjs        # 隠し管理画面の秘匿性・認証・CORS分離・機能を検証（44項目）
+node scraper/test_faq_memory.mjs   # 公式Q&AのAI分析への組み込みを検証（33項目）
 ```
 ※ どちらもプロジェクトディレクトリ内から実行してください（jsdom の解決のため）。
 
@@ -328,6 +364,7 @@ npx wrangler d1 execute webapp-production --file=./scraper/data/seed_cards.sql
 npx wrangler d1 execute webapp-production --file=./scraper/data/seed_rules.sql
 npx wrangler d1 execute webapp-production --file=./migrations/0002_semantic_memory.sql
 npx wrangler d1 execute webapp-production --file=./migrations/0003_data_update.sql
+npx wrangler d1 execute webapp-production --file=./migrations/0004_faq_memory.sql
 npx wrangler pages secret put OPENAI_API_KEY
 npx wrangler pages secret put ADMIN_TOKEN
 npx wrangler pages secret put ADMIN_PASSWORD    # 隠し管理画面のパスワード
@@ -402,7 +439,7 @@ jobs:
 | 入力バリデーション | ✅ 未入力400 / 不正JSON400 / 存在しないカード404 |
 | API キーの漏洩 | ✅ HTML・JS・APIレスポンス全てで検出0件 |
 | AI未設定時のフォールバック | ✅ `/api/ai/status` が `available:false` を返すとUIが案内表示し他機能は継続動作 |
-| 記憶層の構築 | ✅ カード 2,500/2,500・ルール 463/463 ベクトル化、能力裁定 13/13 生成（`/api/memory/stats`） |
+| 記憶層の構築 | ✅ カード 2,500/2,500・ルール 463/463・公式Q&A 79/79 ベクトル化、能力裁定 13/13 生成（`/api/memory/stats`） |
 | 記憶層あり4クエリ通し | ✅ 全て200・24.3〜30.6秒・候補120枚・`vector_search:true`。提案の約8割がベクトル由来 |
 | 経験の再利用 | ✅ 同条件2回目で `recalled:5`、提案 6→9枚に増加し上位が安定 |
 | ルール分断バグの修正効果 | ✅ 「突撃」の裁定が5条文を根拠に完成、「護衛」は2つの効果を両方正しく記述（修正前は片方を不明と回答） |
@@ -454,7 +491,7 @@ D1 への書き込みを伴わないステートレス認証にしているた�
 | **カードデータを更新** | 公式カード検索APIを全ページ巡回し、`cards` / `classifications` / `abilities` / `card_refs` を差分更新。新規カードは名前・版・収録セットをログに表示 | 約1分（2,500枚 / 25ページ） |
 | **ルール改定をチェック** | 公式ルールPDF4文書の `Last-Modified` / `Content-Length` を取得し、取り込み済みバージョンと比較して「要更新 / 最新」を表示 | 数秒 |
 | **公式Q&Aを更新** | 公式ルールFAQページから79件のQ&A（本文つき・14カテゴリ）を取得し `rule_faqs` に差分反映 | 約2秒 |
-| **記憶層を更新** | `/api/memory/build/*` を `next_offset` に沿って自動ループ。`text_hash` 差分なので変更分のみ再ベクトル化 | 変更なしなら数秒 |
+| **記憶層を更新** | `/api/memory/build/*`（カード・ルール条文・**公式Q&A**）を `next_offset` に沿って自動ループ。`text_hash` 差分なので変更分のみ再ベクトル化 | 変更なしなら数秒 |
 
 上部のステータス画面に、カード枚数・ルール節数・Q&A件数・ベクトル化率（未ベクトル化があれば警告表示）・
 公式文書のバージョン一覧・直近ジョブ履歴を表示します。
@@ -505,22 +542,20 @@ npx wrangler pages secret put ADMIN_PATH      # 任意（URL自体を隠した�
    本文取得に使う想定だった `card_qa.php` は**現在 404**（実測）で入手経路がない。
    代替として公式ルールFAQページから 79 件の Q&A 本文を `rule_faqs` に取り込んだ
    （カード単位の紐付けはなし）
-3. **`rule_faqs` の AI プロンプトへの組み込み** — 未実装。取り込みは完了しているが、
-   シナジー分析の根拠として渡す処理（ベクトル化＋プロンプト注入）は次段階
-4. **デッキ→デッキコード発行** — 仕様書 §6.1 の判断通り未実装（公式の1日30回制限のため）。
+3. **デッキ→デッキコード発行** — 仕様書 §6.1 の判断通り未実装（公式の1日30回制限のため）。
    公式デッキビルダーへのリンクで代替
-5. **Lighthouse 90+** — 未計測（サンドボックス環境のため実測は未実施）
-6. **Cloudflare Pages への本番デプロイ** — 未実行（本番では `wrangler pages secret put OPENAI_API_KEY` が別途必要）
-7. **データ更新は手動トリガー** — 隠し管理画面のボタンで実行する方式（下記「データ更新」節）。
+4. **Lighthouse 90+** — 未計測（サンドボックス環境のため実測は未実施）
+5. **Cloudflare Pages への本番デプロイ** — 未実行（本番では `wrangler pages secret put OPENAI_API_KEY` が別途必要）
+6. **データ更新は手動トリガー** — 隠し管理画面のボタンで実行する方式（下記「データ更新」節）。
    自動実行する Cron は未設定。カードを追加したあとは同画面の「記憶層を更新」も押す必要がある
    （再ベクトル化は `text_hash` 差分なので、変更分のみ数秒で完了する）
-8. **web上の情報の集積（外部知識の学習）** — 未実装。設計案は「今後の拡張案」節を参照
-9. **AI の応答は 20～40 秒** — ストリーミング未対応。スケルトン表示で待機させている
+7. **web上の情報の集積（外部知識の学習）** — 未実装。設計案は「今後の拡張案」節を参照
+8. **AI の応答は 20～40 秒** — ストリーミング未対応。スケルトン表示で待機させている
    （記憶層導入後の実測: 24.3〜31.0s、タイムアウトは 90s）
-10. **「強いプレイの動き」の記憶化** — 未実装（**次回の実装課題**）。
-    現在の記憶層はカード・ルール・能力裁定という「静的な知識」に閉じており、
-    「どう動かすと強いか」という**手順の知識**を持たない。設計案は
-    「今後の拡張案: 「強いプレイの動き」を記憶させる」節を参照
+9. **「強いプレイの動き」の記憶化** — 未実装（**次回の実装課題**）。
+   現在の記憶層はカード・ルール・能力裁定・公式Q&Aという「静的な知識」に閉じており、
+   「どう動かすと強いか」という**手順の知識**を持たない。設計案は
+   「今後の拡張案: 「強いプレイの動き」を記憶させる」節を参照
 
 ## 今後の拡張案: 「強いプレイの動き」を記憶させる（未実装・次回実装予定）
 

@@ -35,10 +35,12 @@ import {
   cardEmbedText,
   embed,
   loadAbilityKnowledge,
+  recallFaqs,
   recallSynergy,
   rememberSynergy,
   searchCardVectors,
   vectorsReady,
+  type FaqHit,
 } from '../lib/memory';
 
 const ai = new Hono<{ Bindings: Bindings }>();
@@ -260,6 +262,8 @@ ai.post('/synergy', async (c) => {
     // ここで発生するAPI呼び出しは「クエリ1本の埋め込み」だけ（実測 0.3 秒未満）。
     let vectorHits: Array<{ id: number; sim: number }> = [];
     let vectorUsed = false;
+    // 公式Q&A の想起結果（クエリ埋め込みを再利用するのでここで受ける）
+    let faqHits: FaqHit[] = [];
     try {
       const ready = await vectorsReady(db);
       if (ready.cards > 0) {
@@ -278,6 +282,12 @@ ai.post('/synergy', async (c) => {
             excludeId: base ? Number(base.id) : undefined,
           });
           vectorUsed = vectorHits.length > 0;
+
+          // 同じクエリベクトルを流用して公式Q&Aも想起する（追加のAPI呼び出しは発生しない）。
+          // 公式Q&Aは条文より具体的な状況判断を含むため、デッキ構築の可否判断に効く。
+          if (ready.faqs > 0) {
+            faqHits = await recallFaqs(db, qv, { topK: 6, minSim: 0.28 });
+          }
         }
       }
     } catch (e: any) {
@@ -355,6 +365,12 @@ ai.post('/synergy', async (c) => {
       restrictInk,
       abilityKnowledge,
       memoryNotes,
+      faqs: faqHits.map((f) => ({
+        category: f.category,
+        question: f.question,
+        answer: f.answer,
+        note: f.note,
+      })),
     });
 
     const ranked = await chatJson<RankResult>(
@@ -414,7 +430,15 @@ ai.post('/synergy', async (c) => {
         vector_search: vectorUsed,
         ability_knowledge: abilityKnowledge.length,
         recalled: memoryNotes.length,
+        official_faqs: faqHits.length,
       },
+      // 参照した公式Q&A（UIで「公式Q&Aを根拠にした」と示すため。本文は短いので全文返す）
+      official_faqs: faqHits.map((f) => ({
+        category: f.category,
+        question: f.question,
+        answer: f.answer,
+        similarity: Math.round(f.sim * 1000) / 1000,
+      })),
       model: ranked.model,
       cached: false,
     };

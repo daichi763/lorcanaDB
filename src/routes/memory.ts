@@ -3,6 +3,7 @@
  *
  *  POST /api/memory/build/cards  { batch?, offset?, force? }  カードをベクトル化
  *  POST /api/memory/build/rules  { batch?, offset?, force? }  ルール条文をベクトル化
+ *  POST /api/memory/build/faqs   { batch?, offset?, force? }  公式Q&A をベクトル化
  *  POST /api/memory/build/abilities                            キーワード能力知識を生成
  *  GET  /api/memory/stats                                      記憶の充填状況
  *
@@ -20,6 +21,7 @@ import {
   EMBED_MODEL,
   cardEmbedText,
   embed,
+  faqEmbedText,
   normalize,
   ruleEmbedText,
   sha256,
@@ -38,8 +40,8 @@ const SQL_VAR_CHUNK = 80;
 
 async function fetchHashes(
   db: D1Database,
-  table: 'card_vectors' | 'rule_vectors',
-  idCol: 'card_id' | 'section_id',
+  table: 'card_vectors' | 'rule_vectors' | 'faq_vectors',
+  idCol: 'card_id' | 'section_id' | 'faq_id',
   ids: number[]
 ): Promise<Map<number, string>> {
   const out = new Map<number, string>();
@@ -110,6 +112,10 @@ mem.get('/stats', async (c) => {
     rules: {
       total: await q(`SELECT COUNT(*) AS n FROM rules_sections`),
       vectorized: v.rules,
+    },
+    faqs: {
+      total: await q('SELECT COUNT(*) AS n FROM rule_faqs'),
+      vectorized: v.faqs,
     },
     ability_knowledge: await q('SELECT COUNT(*) AS n FROM ability_knowledge'),
     synergy_memory: await q('SELECT COUNT(*) AS n FROM synergy_memory'),
@@ -230,6 +236,81 @@ mem.post('/build/rules', async (c) => {
           `INSERT INTO rule_vectors (section_id, source_text, text_hash, dims, model, vec, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
            ON CONFLICT(section_id) DO UPDATE SET
+             source_text = excluded.source_text, text_hash = excluded.text_hash,
+             dims = excluded.dims, model = excluded.model, vec = excluded.vec,
+             updated_at = CURRENT_TIMESTAMP`
+        )
+        .bind(t.id, t.text, t.hash, EMBED_DIMS, EMBED_MODEL, toBlob(normalize(vecs[i])))
+    );
+    await runBatched(db, stmts);
+    written = targets.length;
+  }
+
+  const nextOffset = offset + list.length;
+  return c.json({
+    done: list.length < batch,
+    offset,
+    processed: written,
+    skipped: list.length - written,
+    next_offset: list.length < batch ? null : nextOffset,
+  });
+});
+
+// ============================ 公式Q&A のベクトル化 ============================
+
+/**
+ * rule_faqs（公式ルールQ&A）をベクトル化する。
+ * 79件・1件あたり短文なので実質1回の呼び出しで完了するが、
+ * 他の build/* と同じく offset+batch で分割できるようにしておく。
+ */
+mem.post('/build/faqs', async (c) => {
+  if (!authorized(c)) return c.json({ error: 'forbidden' }, 403);
+  const db = c.env.DB;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const batch = Math.min(Math.max(Number(body.batch) || 200, 1), 400);
+  const offset = Math.max(Number(body.offset) || 0, 0);
+  const force = Boolean(body.force);
+
+  let list: any[] = [];
+  try {
+    const rows = await db
+      .prepare(
+        `SELECT id, category, question, answer, note FROM rule_faqs
+          ORDER BY id LIMIT ? OFFSET ?`
+      )
+      .bind(batch, offset)
+      .all();
+    list = (rows.results ?? []) as any[];
+  } catch {
+    // rule_faqs 未作成（マイグレーション0003未適用）
+    return c.json({ done: true, offset, processed: 0, skipped: 0, next_offset: null, note: 'rule_faqs not found' });
+  }
+  if (!list.length) {
+    return c.json({ done: true, offset, processed: 0, skipped: 0, next_offset: null });
+  }
+
+  const ids = list.map((r) => Number(r.id));
+  const existing = force
+    ? new Map<number, string>()
+    : await fetchHashes(db, 'faq_vectors', 'faq_id', ids);
+
+  const targets: Array<{ id: number; text: string; hash: string }> = [];
+  for (const r of list) {
+    const text = faqEmbedText(r);
+    const hash = await sha256(`${EMBED_MODEL}:${EMBED_DIMS}:${text}`);
+    if (existing.get(Number(r.id)) === hash) continue;
+    targets.push({ id: Number(r.id), text, hash });
+  }
+
+  let written = 0;
+  if (targets.length) {
+    const vecs = await embed(c.env, targets.map((t) => t.text), { dims: EMBED_DIMS });
+    const stmts = targets.map((t, i) =>
+      db
+        .prepare(
+          `INSERT INTO faq_vectors (faq_id, source_text, text_hash, dims, model, vec, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+           ON CONFLICT(faq_id) DO UPDATE SET
              source_text = excluded.source_text, text_hash = excluded.text_hash,
              dims = excluded.dims, model = excluded.model, vec = excluded.vec,
              updated_at = CURRENT_TIMESTAMP`
