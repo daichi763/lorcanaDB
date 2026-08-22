@@ -19,6 +19,15 @@
 import { Hono } from 'hono';
 import type { Bindings } from '../types';
 import {
+  COOKIE_NAME,
+  SESSION_TTL,
+  adminPassword,
+  issueSession,
+  readCookie,
+  timingSafeEqual,
+  verifySession,
+} from '../lib/adminAuth';
+import {
   PER_PAGE,
   applyCards,
   checkRuleSources,
@@ -31,70 +40,13 @@ import {
 
 const admin = new Hono<{ Bindings: Bindings }>();
 
-/** セッションの有効期間（秒）。作業単位としては十分で、放置リスクは抑えたい */
-const SESSION_TTL = 60 * 60 * 2;
-const COOKIE_NAME = '__ops_sess';
 /** 1リクエストで処理するページ数。礼儀スリープ1.2s×5 + API応答 ≒ 8秒程度に収める */
 const PAGES_PER_CALL = 5;
 
 // ---------------------------------------------------------------- 認証基盤
-
-const enc = new TextEncoder();
-
-const b64url = (buf: ArrayBuffer | Uint8Array) => {
-  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  let s = '';
-  for (const b of bytes) s += String.fromCharCode(b);
-  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-};
-
-async function hmac(key: string, msg: string): Promise<string> {
-  const k = await crypto.subtle.importKey('raw', enc.encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-  return b64url(await crypto.subtle.sign('HMAC', k, enc.encode(msg)));
-}
-
-/** タイミング攻撃を避けるため、長さと内容を定数時間で比較する */
-function timingSafeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
-}
-
-function adminPassword(env: Bindings): string | null {
-  // ADMIN_PASSWORD が未設定なら ADMIN_TOKEN で代替（記憶層構築と同じ鍵で運用できる）
-  const pw = (env as any).ADMIN_PASSWORD || (env as any).ADMIN_TOKEN || '';
-  return pw ? String(pw) : null;
-}
-
-async function issueSession(env: Bindings): Promise<string> {
-  const pw = adminPassword(env);
-  if (!pw) throw new Error('no password configured');
-  const exp = Math.floor(Date.now() / 1000) + SESSION_TTL;
-  const payload = `v1.${exp}`;
-  return `${payload}.${await hmac(pw, payload)}`;
-}
-
-async function verifySession(env: Bindings, token: string | null): Promise<boolean> {
-  const pw = adminPassword(env);
-  if (!pw || !token) return false;
-  const parts = token.split('.');
-  if (parts.length !== 3 || parts[0] !== 'v1') return false;
-  const exp = Number(parts[1]);
-  if (!Number.isFinite(exp) || exp < Math.floor(Date.now() / 1000)) return false;
-  const expected = await hmac(pw, `v1.${exp}`);
-  return timingSafeEqual(expected, parts[2]);
-}
-
-function readCookie(c: any, name: string): string | null {
-  const raw = c.req.header('cookie') || '';
-  for (const part of raw.split(';')) {
-    const i = part.indexOf('=');
-    if (i < 0) continue;
-    if (part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return null;
-}
+// セッションの発行・検証は src/lib/adminAuth.ts に一本化している。
+// 記憶層API（routes/memory.ts）も同じ実装を使うので、本番でも
+// 管理画面のログインだけで記憶層の更新ができる。
 
 /** 総当たり対策。失敗はメモリ上で数える（Workers のインスタンス単位でよい） */
 const failures = new Map<string, { n: number; until: number }>();

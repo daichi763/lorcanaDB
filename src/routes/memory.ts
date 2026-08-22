@@ -8,7 +8,7 @@
  *  GET  /api/memory/stats                                      記憶の充填状況
  *
  * 安全設計
- *  - 書き込み系は ADMIN_TOKEN 必須（未設定ならローカル開発のみ許可）。
+ *  - 書き込み系は管理者のみ（管理画面のセッションクッキー、または ADMIN_TOKEN ヘッダ）。
  *    ベクトル化は LLM 課金を伴うため、公開状態で誰でも叩けてはならない。
  *  - 1リクエストで全件やろうとすると Workers の CPU/時間上限に当たるため、
  *    offset + batch で分割実行し、進捗を返す。
@@ -28,6 +28,7 @@ import {
   toBlob,
   vectorsReady,
 } from '../lib/memory';
+import { isAdminRequest } from '../lib/adminAuth';
 
 const mem = new Hono<{ Bindings: Bindings }>();
 
@@ -83,14 +84,13 @@ mem.use('*', async (c, next) => {
 });
 
 /** 書き込み権限の確認 */
-function authorized(c: any): boolean {
-  const want = c.env.ADMIN_TOKEN;
-  const got = c.req.header('x-admin-token') || '';
-  if (want) return got === want;
-  // ADMIN_TOKEN 未設定時はローカル開発を想定し、localhost からのみ許可
-  const host = c.req.header('host') || '';
-  return /^(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?$/.test(host);
-}
+/**
+ * 管理者判定は lib/adminAuth の isAdminRequest に一本化している。
+ *  - 管理画面（/_ops）でログイン済みなら __ops_sess クッキーで通る（本番もこれ）
+ *  - CLI からは x-admin-token: ADMIN_TOKEN でも通る
+ *  - どちらの鍵も無い環境では localhost のみ許可（ローカル開発）
+ */
+const authorized = (c: any) => isAdminRequest(c);
 
 // ============================ 状況確認 ============================
 
@@ -125,7 +125,7 @@ mem.get('/stats', async (c) => {
 // ============================ カードのベクトル化 ============================
 
 mem.post('/build/cards', async (c) => {
-  if (!authorized(c)) return c.json({ error: 'forbidden' }, 403);
+  if (!(await authorized(c))) return c.json({ error: 'forbidden' }, 403);
   const db = c.env.DB;
   const body = await c.req.json().catch(() => ({}) as any);
   const batch = Math.min(Math.max(Number(body.batch) || 200, 1), 400);
@@ -195,7 +195,7 @@ mem.post('/build/cards', async (c) => {
 // ============================ ルール条文のベクトル化 ============================
 
 mem.post('/build/rules', async (c) => {
-  if (!authorized(c)) return c.json({ error: 'forbidden' }, 403);
+  if (!(await authorized(c))) return c.json({ error: 'forbidden' }, 403);
   const db = c.env.DB;
   const body = await c.req.json().catch(() => ({}) as any);
   const batch = Math.min(Math.max(Number(body.batch) || 150, 1), 400);
@@ -264,7 +264,7 @@ mem.post('/build/rules', async (c) => {
  * 他の build/* と同じく offset+batch で分割できるようにしておく。
  */
 mem.post('/build/faqs', async (c) => {
-  if (!authorized(c)) return c.json({ error: 'forbidden' }, 403);
+  if (!(await authorized(c))) return c.json({ error: 'forbidden' }, 403);
   const db = c.env.DB;
   const body = await c.req.json().catch(() => ({}) as any);
   const batch = Math.min(Math.max(Number(body.batch) || 200, 1), 400);
@@ -348,7 +348,7 @@ const KNOWLEDGE_SYSTEM = `あなたはディズニー ロルカナの公式総�
 {"summary":"...","synergy_notes":["..."],"caveats":["..."]}`;
 
 mem.post('/build/abilities', async (c) => {
-  if (!authorized(c)) return c.json({ error: 'forbidden' }, 403);
+  if (!(await authorized(c))) return c.json({ error: 'forbidden' }, 403);
   const db = c.env.DB;
   const body = await c.req.json().catch(() => ({}) as any);
   const only: string[] = Array.isArray(body.only) ? body.only.map(String) : [];

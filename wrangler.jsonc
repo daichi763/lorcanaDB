@@ -1,18 +1,33 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "webapp",
+  "name": "lorcana-fandb",
   "compatibility_date": "2026-08-15",
   "pages_build_output_dir": "./dist",
   "compatibility_flags": [
     "nodejs_compat"
   ],
   // カードDB / ルールDB（SQLite → D1）
-  // ローカル開発は --local で .wrangler/state 配下の SQLite を自動使用
+  //
+  // ローカル開発:  database_name = webapp-production（--local で
+  //                .wrangler/state/v3/d1 の SQLite を使う。database_id は参照されない）
+  // 本番:          env.production 側の設定が使われる（下記）。
+  //                本番デプロイは必ず `--env production` を付ける。
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "webapp-production",
       "database_id": "local-dev-placeholder"
     }
-  ]
+  ],
+  "env": {
+    "production": {
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "lorcana-fandb-production",
+          "database_id": "fa110334-4615-42f4-9216-34bb4a99fa3b"
+        }
+      ]
+    }
+  }
 }
