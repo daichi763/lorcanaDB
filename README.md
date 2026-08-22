@@ -8,7 +8,8 @@
   デッキコード互換のデッキビルダーを提供する
 - **収録**: **2,500 枚**（公式 API の `count` と完全一致）、26 セット、42 種族、
   1,255 件のキーワード能力タグ、463 節の公式ルール
-- **ステータス**: サンドボックスで稼働確認済み / Cloudflare Pages 未デプロイ
+- **ステータス**: **Cloudflare Pages に本番デプロイ済み（稼働中）** / サンドボックスでも稼働確認済み
+- **本番URL**: https://lorcana-fandb.pages.dev
 
 ## 主な機能
 
@@ -357,21 +358,73 @@ node scraper/test_faq_memory.mjs   # 公式Q&AのAI分析への組み込みを�
 
 ## デプロイ（Cloudflare Pages）
 
+### 本番環境（稼働中）
+
+| 項目 | 値 |
+|---|---|
+| 本番URL | https://lorcana-fandb.pages.dev |
+| Pages プロジェクト | `lorcana-fandb`（production branch: `main`） |
+| D1 データベース | `lorcana-fandb-production`（`fa110334-4615-42f4-9216-34bb4a99fa3b`） |
+| 隠し管理画面 | `/_ops` および `/x7f2q9`（`ADMIN_PATH`） |
+| 最終デプロイ | 2026-08-22 |
+
+**⚠ `--env production` が必須**。`wrangler.jsonc` はローカル開発用の D1 を
+トップレベルに、本番用の実 D1 を `env.production` に置いて分離している。
+フラグを付けずにデプロイするとプレースホルダの `database_id` が使われて失敗する。
+
 ```bash
-npx wrangler d1 create webapp-production          # 発行された database_id を wrangler.jsonc に記入
-npx wrangler d1 execute webapp-production --file=./migrations/0001_initial_schema.sql
-npx wrangler d1 execute webapp-production --file=./scraper/data/seed_cards.sql
-npx wrangler d1 execute webapp-production --file=./scraper/data/seed_rules.sql
-npx wrangler d1 execute webapp-production --file=./migrations/0002_semantic_memory.sql
-npx wrangler d1 execute webapp-production --file=./migrations/0003_data_update.sql
-npx wrangler d1 execute webapp-production --file=./migrations/0004_faq_memory.sql
-npx wrangler pages secret put OPENAI_API_KEY
-npx wrangler pages secret put ADMIN_TOKEN
-npx wrangler pages secret put ADMIN_PASSWORD    # 隠し管理画面のパスワード
-npx wrangler pages secret put ADMIN_PATH        # 任意（管理画面の別URL）
-npm run build && npx wrangler pages deploy dist --project-name webapp
-# デプロイ後に記憶層を1回だけ構築（/api/memory/build/* を x-admin-token 付きで叩く）
+# 1) D1 を作る（database_id を wrangler.jsonc の env.production に記入）
+npx wrangler d1 create lorcana-fandb-production
+
+# 2) スキーマとデータを流す（--remote で本番、--env production でバインディング解決）
+for f in migrations/0001_initial_schema.sql migrations/0002_semantic_memory.sql \
+         migrations/0003_data_update.sql migrations/0004_faq_memory.sql \
+         scraper/data/seed_cards.sql scraper/data/seed_rules.sql; do
+  npx wrangler d1 execute lorcana-fandb-production --remote --env production --file=$f
+done
+
+# 3) Pages プロジェクトを作る
+npx wrangler pages project create lorcana-fandb --production-branch main
+
+# 4) シークレット（値は標準入力から読むのでパイプで渡す）
+for k in OPENAI_API_KEY OPENAI_BASE_URL AI_MODEL AI_MODEL_FAST ADMIN_PASSWORD ADMIN_PATH; do
+  printf '%s' "$VALUE" | npx wrangler pages secret put $k --project-name lorcana-fandb
+done
+
+# 5) デプロイ
+npm run build
+npx wrangler pages deploy dist --project-name lorcana-fandb --branch main
 ```
+
+### デプロイ後に一度だけ行う「記憶層の構築」
+
+本番 D1 にはベクトルが入っていない状態から始まる。**隠し管理画面にログインし、
+「公式Q&Aを取り込む」→「記憶層を更新」を押すだけ**でよい（管理画面のセッションで
+`/api/memory/build/*` が認可されるため、`ADMIN_TOKEN` の設定は任意）。
+
+実測（本番 2026-08-22）:
+
+| 対象 | 件数 | 所要 |
+|---|---|---|
+| 公式Q&A の取り込み（`/api/_ops/update/faqs`） | 79 件 insert | 8 秒 |
+| ルール条文ベクトル | 463 件 | 4 秒（200件×3回） |
+| 公式Q&Aベクトル | 79 件 | 1 秒 |
+| カードベクトル | 2,500 件 | 25 秒（200件×13回） |
+| キーワード能力知識 | 13 件 | 168 秒 |
+
+CLI から回す場合は `x-admin-token: $ADMIN_TOKEN`（要 `ADMIN_TOKEN` secret）か、
+`POST /api/_ops/login` で得た `__ops_sess` クッキーを付けて
+`/api/memory/build/{cards,rules,faqs,abilities}` を `offset` を進めながら呼ぶ。
+
+### 必要な Cloudflare API トークン権限
+
+| スコープ | 権限 | 用途 |
+|---|---|---|
+| Account → Cloudflare Pages | Edit | プロジェクト作成・デプロイ・secret |
+| Account → D1 | Edit | DB 作成・マイグレーション・seed |
+| Account → Account Settings | Read | `wrangler whoami` のアカウント解決 |
+| User → User Details | Read | トークン所有者の確認 |
+| Zone → DNS / Zone | Edit / Read | **独自ドメインを付ける場合のみ** |
 
 差分更新の Cron 例（GitHub Actions、夜間バッチ）:
 
@@ -545,14 +598,13 @@ npx wrangler pages secret put ADMIN_PATH      # 任意（URL自体を隠した�
 3. **デッキ→デッキコード発行** — 仕様書 §6.1 の判断通り未実装（公式の1日30回制限のため）。
    公式デッキビルダーへのリンクで代替
 4. **Lighthouse 90+** — 未計測（サンドボックス環境のため実測は未実施）
-5. **Cloudflare Pages への本番デプロイ** — 未実行（本番では `wrangler pages secret put OPENAI_API_KEY` が別途必要）
-6. **データ更新は手動トリガー** — 隠し管理画面のボタンで実行する方式（下記「データ更新」節）。
+5. **データ更新は手動トリガー** — 隠し管理画面のボタンで実行する方式（下記「データ更新」節）。
    自動実行する Cron は未設定。カードを追加したあとは同画面の「記憶層を更新」も押す必要がある
    （再ベクトル化は `text_hash` 差分なので、変更分のみ数秒で完了する）
-7. **web上の情報の集積（外部知識の学習）** — 未実装。設計案は「今後の拡張案」節を参照
-8. **AI の応答は 20～40 秒** — ストリーミング未対応。スケルトン表示で待機させている
+6. **web上の情報の集積（外部知識の学習）** — 未実装。設計案は「今後の拡張案」節を参照
+7. **AI の応答は 20～40 秒** — ストリーミング未対応。スケルトン表示で待機させている
    （記憶層導入後の実測: 24.3〜31.0s、タイムアウトは 90s）
-9. **「強いプレイの動き」の記憶化** — 未実装（**次回の実装課題**）。
+8. **「強いプレイの動き」の記憶化** — 未実装（**次回の実装課題**）。
    現在の記憶層はカード・ルール・能力裁定・公式Q&Aという「静的な知識」に閉じており、
    「どう動かすと強いか」という**手順の知識**を持たない。設計案は
    「今後の拡張案: 「強いプレイの動き」を記憶させる」節を参照
