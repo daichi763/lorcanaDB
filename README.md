@@ -26,6 +26,7 @@
 | 比較モード | 最大4枚を並列表示 |
 | 鑑賞モード | 公式画像を lightbox 拡大 |
 | お気に入り | LocalStorage のみ（ログイン不要・サーバ送信なし） |
+| **最新環境情報（日次更新）** | **公開情報を自動収集して「いま何が強いか」を毎日22:00（JST）に更新**。トップ左カラムと `/meta`、デッキレシピ、AI提案に反映（下記「最新環境情報」参照） |
 | **データ更新（隠し管理画面）** | **公式の新弾追加・ルール改定に追随。パスワード保護された非公開URLから差分更新を実行**（下記「データ更新（隠し管理画面）」参照） |
 
 ## URL / エンドポイント
@@ -37,6 +38,7 @@
 | `/` | カード検索（URLクエリで条件を共有可: `?q=&ink_color=&classification=&ink_cost_min=` 等） |
 | `/cards/:card_file` または `/cards/:id` | カード詳細 |
 | `/deck` | デッキビルダー（`?d=<file:枚数,…>` で共有、`?add=<card_file>` で単体追加、`?deck=<code>` でコード指定） |
+| `/meta` | **最新環境情報**ダッシュボード（日次更新・日本/海外のハイライト・メタシェア・今後の予定） |
 | `/synergy` | シナジー探索（`?c=<種族名>`） |
 | `/rules` | 公式ルール検索（`?q=&source=`） |
 | `/favorites` | お気に入り |
@@ -60,6 +62,7 @@
 | GET | `/api/rules/toc` | ルール目次 |
 | GET | `/api/rules/section/:id` | 単一セクション（冒頭400文字まで） |
 | POST | `/api/deck/import` | `{code:"…"}` → 公式APIプロキシでデッキ復号 |
+| GET | `/api/meta/report` 他 | **最新環境情報**（`report` / `snapshot` / `events` / `decks` / `decks/:id` / `credits` / `status`。詳細は「最新環境情報」節） |
 | GET | `/api/health` | ヘルスチェック |
 
 **管理API（`/api/_ops/*`）** — 隠し管理画面専用。CORS を付けない（同一オリジン限定）、`Cache-Control: no-store`、`X-Robots-Tag: noindex`。
@@ -75,6 +78,11 @@
 | POST | `/api/_ops/update/rules-check` | 公式ルールPDFの更新有無チェック（`Last-Modified` 比較） |
 | POST | `/api/_ops/update/rules-mark` | 取り込み済みバージョンの記録 |
 | POST | `/api/_ops/update/faqs` | 公式ルールQ&A（79件）の取得・更新 |
+| POST | `/api/_ops/meta/collect` | 最新環境情報の収集（1回に1ソース。`{done, remaining, next}` を返す） |
+| POST | `/api/_ops/meta/aggregate` | イベント抽出とメタシェア集計（LLM不使用） |
+| POST | `/api/_ops/meta/summarize` | LLM要約の生成（失敗時は前日分を維持） |
+| POST | `/api/_ops/meta/memory` | 環境情報を記憶層へ反映 |
+| GET | `/api/_ops/meta/status` | 収集の詳細状態（失敗理由まで返す） |
 
 **記憶層API（`/api/memory/*`）**: `GET /stats`、`POST /build/cards`、`POST /build/rules`、`POST /build/faqs`、`POST /build/abilities`（いずれも `ADMIN_TOKEN` 必須）
 
@@ -238,6 +246,173 @@
 | 自由記述のみ（LLM 2回） | 約 24 秒 |
 | キャッシュヒット | 約 55 ms |
 
+---
+
+## 最新環境情報（日次更新）
+
+トップページ左カラムのウィジェットと `/meta` の専用ダッシュボードで、
+**「いま何が強いか・次に何が来るか」** を毎日更新して表示します。
+公開情報を自動収集し、LLM で日本語に要約したうえで、
+デッキタブ・AIシナジー提案にも同じ情報を流し込む構成です。
+
+### 表示するもの
+
+| 場所 | 内容 |
+|---|---|
+| `/`（左カラム `#meta-widget`） | 要点のダイジェスト（最終更新日・注目カード画像・予定の件数） |
+| `/meta` | 全文ダッシュボード。🇯🇵日本環境ハイライト / 🌎海外環境ハイライト / 📅明日以降の予定（各160〜300字）、日本と海外の違い、注目カード、メタシェア表（日本/海外）、注目デッキレシピ、公式情報リンク、データ提供元 |
+| `/deck`（`#meta-recipes`） | 収集したデッキレシピ。**日本語版カードのみで組めるもの（`playable_jp=1`）だけ**を掲載。インク色フィルタ・ページング・「ビルダーに読み込む」対応。`/deck?meta=<id>` で個別レシピを直接開ける |
+| `/synergy`（AI提案） | 提案時に環境情報を参照。日付を添えて「〜時点の集計では」の形で言及する |
+
+### 引用方針（最重要・仕様§1.3）
+
+**表示上のクレジットとリンクは、原則として公式情報のみ**に付けます。
+
+- 公式情報（`takaratomy.co.jp` / `disneylorcana.com` / `tcg.ravensburgerplay.com` / `disney.co.jp`）
+  → **出典URLを明示してリンク**する
+- 非公式情報（X・note・海外コミュニティサイトなど）
+  → **要約の材料としてのみ使用**し、本文を逐語引用しない。
+    個別のアカウント名・記事名・URLは**表示しない**
+- 帰属節は「複数のプレイヤーの発信によると」「複数の集計情報によると」といった
+  **集約表現**に自動で書き換える
+
+この方針は**2層で機械的に強制**しています。
+
+1. `src/lib/metaReport.ts` の `scrubText()` — 生成された要約から
+   非公式URL・`@ハンドル`・非公式サイト名・英数字ID＋敬称を除去し、
+   除去痕は `meta_logs` に必ず記録する（黙って直さない）
+2. `public/static/page-meta.js` の `isOfficial()` — 描画時にも公式ドメインを再検査してからアンカー化する
+
+#### 例外（2つだけ）
+
+| 例外 | 理由 | 実装 |
+|---|---|---|
+| **デッキレシピの出典** | レシピは他者の構築物であり、出典を示さずに掲載するのは不適切 | `/api/meta/decks` のみ `source_url` / `source_label` を返し、`rel="noopener noreferrer nofollow"` で「出典: <ラベル>」を表示 |
+| **可視クレジット必須のデータ提供元** | 利用規約で「visible credit and link back」が必須のAPI（**TopDeck.gg**）がある。大会データの価値が高いため採用し、規約を満たす | `meta_sources.requires_credit=1` のソースを `GET /api/meta/credits` が返し、`/meta` と `/deck` の**専用の帰属表示欄**（`#meta-credits`）に常時掲出 |
+
+TopDeck.gg については **「本文の文体は§1.3のまま（集約表現）を保ち、規約は帰属表示欄で満たす」**
+という分離方針を採っています。要約本文にサイト名を混ぜることはせず、
+`Tournament data provided by TopDeck.gg` を独立した欄に出します。
+
+### 収集ソース（23件・robots / Content-Signal を実測して判定）
+
+| 分類 | ソース | 状態 |
+|---|---|---|
+| 公式（日本） | タカラトミー ニュース / コラム / イベント | 有効・出典リンク可 |
+| 公式（海外） | Ravensburger ニュース / Recap | 有効・出典リンク可 |
+| 公式X | `@lorcana_jp` / `@DisneyLorcana` | `X_BEARER_TOKEN` 設定時に有効 |
+| 集計 | lorcanahunter メタ集計（`/en/meta`）・大会サイトマップ | 有効（本文は取得せず、集計値と見出しのみ） |
+| 大会API | **TopDeck.gg**（`POST /api/v2/tournaments`） | `TOPDECK_API_KEY` 設定時に有効・**可視クレジット必須** |
+| 海外サイト | tcgcontender / elorcana（サイトマップの新着のみ） | 有効 |
+| 日本コミュニティ | note・コミュニティ記事・X（コミュニティ枠） | 有効（材料としてのみ・表示クレジットなし） |
+| **無効化** | `lorcana.gg` | RSSの内容がカジノ/ベッティングのアフィリエイト記事に変質していたため除外 |
+| **無効化** | `mushureport`（RSS / `wiki/api.php`） | Cloudflare のBot保護で 403。MediaWiki API も同様 |
+| **無効化** | `reddit.com` | `robots.txt` が全面 `Disallow` |
+| **無効化** | `api-lorcana.com` | データが2024年で更新停止 |
+
+X（旧Twitter）は `x.com/robots.txt` が `User-agent: * / Disallow: /` のため、
+**スクレイピングは行わず公式API（有料）のみ**を経路とします（`method='x_api'`）。
+
+#### Content-Signal への対応
+
+`search=yes,ai-train=no,use=reference` を掲げているサイト（lorcana.gg / mushureport /
+tcgcontender / topdeck）については `allow_memory=0` を設定し、
+**当日の要約材料としてのみ使用し、記憶層（ベクトルDB）へは永続化しません**
+（永続化は「学習利用」と読めるため）。
+
+### 更新パイプライン（4段）
+
+Cloudflare Workers のCPU時間制限を避けるため、外部から駆動する分割方式です。
+
+```
+① collect   … 1回のリクエストで1ソースだけ取得（done/remaining で進捗を返す）
+② aggregate … イベント抽出・メタシェア集計（LLM不使用・決定的）
+③ summarize … LLMで要約生成 → scrubText() で引用方針を機械的に強制
+④ memory    … レポートと集計を記憶層（meta_knowledge / meta_vectors）へ反映
+```
+
+- **毎日 22:00（JST）** に GitHub Actions（`.github/workflows/meta-daily.yml`、
+  cron `0 13 * * *`）が①〜④を順に叩きます
+- **③が失敗しても既存レポートは書き換えません**（仕様§6：前日分の表示を維持）。
+  フロントは `stale=true` を受けて「本日分は未生成のため、直近のレポートを表示しています」と明示します
+- APIキー未設定のソース（X / TopDeck.gg）は
+  `{ok:true, detail:{skipped:'no_…'}}` を返す**スキップ扱い**なので、日次ジョブは落ちません
+- 管理画面（`/_ops`）からも同じ4段を手動実行できます
+  （①は完了までフロント側でループします）
+
+#### GitHub Actions に必要な Secrets
+
+| Secret | 用途 |
+|---|---|
+| `SITE_BASE_URL` | 例 `https://lorcana-fandb.pages.dev` |
+| `ADMIN_PASSWORD` | 管理APIのログインパスワード（Cloudflare のシークレットと同じ値） |
+
+#### Cloudflare のシークレット（任意・未設定でも動作）
+
+| シークレット | 用途 |
+|---|---|
+| `X_BEARER_TOKEN` | X 公式API（有料プラン）。未設定ならX系ソースはスキップ |
+| `TOPDECK_API_KEY` | TopDeck.gg 大会API。未設定ならスキップ |
+
+### 時刻の扱い（3種を混同しない）
+
+| 列 | 意味 | 表示 |
+|---|---|---|
+| `observed_at` | **情報そのものの日付**（記事の公開日・大会の開催日） | ユーザーに見せる |
+| `fetched_at` | こちらが取得した時刻 | 監視用 |
+| `updated_at` | レコードを書き換えた時刻 | 監視用 |
+
+「昨日取得した先週の記事」を「昨日の情報」として出さないための分離です。
+
+### AIシナジー提案への注入
+
+`POST /api/ai/synergy` は、質問文の埋め込みベクトルを**再利用**して
+`recallMeta(db, qv, {topK:4, minSim:0.32})` で関連する環境情報を引き当て、
+プロンプトへ入れます。プロンプトでは以下を明示しています。
+
+> これは「今の環境で何が強いか」の参考情報であり、**ルールや効果の根拠にはならない**。
+> カードの挙動は必ず効果テキストと公式Q&Aで判断すること。
+> 環境情報を根拠に助言する場合は「〈日付〉時点の集計では」のように時点を添えて述べ、
+> 将来も同じであると断定しない。
+
+レスポンスには `meta.as_of` と `meta.items[]`（scope / title / observed_at / 公式URL / 類似度）、
+`memory.meta_context`（参照件数）が入ります。
+
+### 環境情報API
+
+| メソッド | パス | 内容 |
+|---|---|---|
+| GET | `/api/meta/report?date=` | 日次レポート本文。未生成なら `report:null`、当日分が無ければ直近を `stale:true` で返す |
+| GET | `/api/meta/snapshot?region=jp\|en&kind=ink_pair\|archetype\|card&limit=` | メタシェア集計。**最新の `computed_at` を持つ出自1系統だけ**を返す（`initial_seed` と `lh_meta` の混在防止） |
+| GET | `/api/meta/events?scope=upcoming\|past&limit=` | イベント一覧（残日数つき） |
+| GET | `/api/meta/decks?jp_only=1&ink=&limit=&offset=` | デッキレシピ一覧（**出典URLを含む唯一の経路**） |
+| GET | `/api/meta/decks/:id` | レシピ詳細（カード明細・日本語版に無いカードは `missing_cards`） |
+| GET | `/api/meta/credits` | **可視クレジット必須のデータ提供元**（`key` / `label` / `url` のみ） |
+| GET | `/api/meta/status` | 収集の健全性（非公式ソースの **URLは返さない**） |
+
+**管理API**: `POST /api/_ops/meta/{collect,aggregate,summarize,memory}`、`GET /api/_ops/meta/status`
+
+### テーブル（`migrations/0005`〜`0008`）
+
+| テーブル | 内容 |
+|---|---|
+| `meta_sources` (23) | 収集元定義。`method` / `trust` / `is_official` / `content_signal` / `allow_memory` / `requires_secret` / `requires_credit` / `credit_label` / `credit_url` / `fail_streak` |
+| `meta_raw_items` | 取得した生データ（見出しと短い抜粋のみ。逐語引用はしない） |
+| `meta_events` | イベント（`event_key` で冪等 upsert、`scale` = major/challenge/local） |
+| `meta_snapshots` | メタシェア集計（`detail.source` に出自を記録） |
+| `meta_decks` / `meta_deck_cards` | デッキレシピと明細（`playable_jp` フラグつき） |
+| `meta_reports` | 日次レポート（`status='published'` のみ公開） |
+| `meta_knowledge` / `meta_vectors` | 記憶層（256次元・`allow_memory=0` のソースは入れない） |
+| `meta_jobs` / `meta_logs` | ジョブ履歴と、引用方針の自動修正ログ |
+
+### 検証
+
+```bash
+node scraper/test_meta.mjs   # 88項目（公開API・引用方針・出自分離・帰属表示・認証・スキップ挙動）
+```
+
+---
+
 ## データアーキテクチャ
 
 - **ストレージ**: **Cloudflare D1**（SQLite 互換）
@@ -255,6 +430,9 @@
   - `rules_sections` (463) — 公式ルール本文（表示は抜粋のみ）
   - `rule_faqs` (79) — **公式ルールQ&A（質問・回答本文つき、14カテゴリ）**
   - `update_jobs` / `update_log` / `source_versions` — **データ更新ジョブの進捗・ログ・公式文書バージョン**
+  - `meta_sources` / `meta_raw_items` / `meta_events` / `meta_snapshots` / `meta_decks` /
+    `meta_deck_cards` / `meta_reports` / `meta_knowledge` / `meta_vectors` / `meta_jobs` / `meta_logs`
+    — **最新環境情報**（上記「最新環境情報」節を参照）
   - `meta` / `rate_limit` / `ai_rate_limit` / `ai_cache`
 
 ### テキストとルールの保存状況（実測値）
@@ -353,6 +531,7 @@ UI は AI タブに案内を出し、種族逆引きなど他の機能はその�
 node scraper/test_synergy_ui.mjs   # jsdom で /synergy を実動作検証（35項目）
 node scraper/test_admin.mjs        # 隠し管理画面の秘匿性・認証・CORS分離・機能を検証（44項目）
 node scraper/test_faq_memory.mjs   # 公式Q&AのAI分析への組み込みを検証（33項目）
+node scraper/test_meta.mjs         # 最新環境情報（引用方針・出自分離・帰属表示・認証）を検証（88項目）
 ```
 ※ どちらもプロジェクトディレクトリ内から実行してください（jsdom の解決のため）。
 
