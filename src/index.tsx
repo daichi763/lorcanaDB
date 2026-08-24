@@ -251,6 +251,32 @@ app.get('/deck', (c) =>
         </aside>
       </div>
 
+      {/*
+        環境情報の収集で取得したデッキレシピ。
+        日本で組めるもの（playable_jp=1）のみを保存・表示する。
+        まとめ本文では非公式ソースを明記しないが、デッキレシピは仕様§1.3の例外として
+        出典URLを必ず明記する。
+      */}
+      <section id="meta-recipes" class="mt-8 scroll-mt-20">
+        <div class="flex items-baseline justify-between gap-3 mb-1">
+          <h2 class="text-lg font-bold text-slate-100">
+            <i class="fas fa-bookmark mr-2 text-sky-400"></i>
+            収集したデッキレシピ
+          </h2>
+          <a href="/meta" class="text-xs text-sky-400 hover:text-sky-300 shrink-0">
+            最新環境情報へ <i class="fas fa-arrow-right ml-0.5"></i>
+          </a>
+        </div>
+        <p class="text-xs text-slate-500 mb-3">
+          大会結果やコミュニティから収集したレシピのうち、<strong class="text-slate-400">日本で発売済みのカードのみで組めるもの</strong>を掲載しています。
+          各レシピには出典元を明記しています。
+        </p>
+        <div id="meta-recipes-filters" class="flex flex-wrap gap-2 mb-3"></div>
+        <div id="meta-recipes-list" class="grid gap-3 md:grid-cols-2"></div>
+        <div id="meta-recipes-more" class="mt-3"></div>
+        <div id="meta-recipe-detail" class="mt-4"></div>
+      </section>
+
       <div id="lightbox" role="dialog" aria-modal="true" aria-label="カード画像拡大">
         <button
           id="lightbox-close"
