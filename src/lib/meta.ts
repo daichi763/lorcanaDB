@@ -1568,7 +1568,9 @@ export async function collectTopdeck(
     method: 'POST',
     headers: { Authorization: apiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      game: 'Lorcana',
+      // game / format は大文字小文字まで一致が必要（公式ドキュメントの一覧表記に合わせる）。
+      // 「Lorcana」ではなく「Disney Lorcana」が正しいゲーム名。
+      game: 'Disney Lorcana',
       format: 'Core Constructed',
       last: days,
       participantMin: minPlayers,
