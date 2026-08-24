@@ -309,6 +309,38 @@ meta.get('/decks/:id', async (c) => {
   }
 });
 
+// ============================ 帰属表示（クレジット必須ソース） ============================
+/**
+ * GET /api/meta/credits
+ *
+ * 仕様§1.3 は「非公式ソースは表示上クレジットしない」が原則だが、
+ * 利用規約で可視クレジットが必須のソース（例: TopDeck.gg の Attribution Required）は
+ * デッキレシピ欄と同じ扱いの「例外」として、専用の帰属表示欄に常時掲出する。
+ * まとめ本文の文体は§1.3のまま保ち、規約はこの欄で満たす、という分離。
+ *
+ * 返すのは requires_credit=1 かつ enabled=1 のソースのみ。
+ * ラベルとリンク先URL以外の情報（記事本文など）は一切返さない。
+ */
+meta.get('/credits', async (c) => {
+  let credits: Array<{ key: string; label: string; url: string }> = [];
+  try {
+    const rows = await c.env.DB.prepare(
+      `SELECT key, credit_label, label, credit_url, url
+         FROM meta_sources
+        WHERE requires_credit = 1 AND enabled = 1
+        ORDER BY key ASC`
+    ).all();
+    credits = ((rows.results ?? []) as any[]).map((r) => ({
+      key: String(r.key),
+      label: String(r.credit_label ?? r.label ?? r.key),
+      url: String(r.credit_url ?? r.url ?? ''),
+    }));
+  } catch {
+    /* マイグレーション未適用でも 200 を返す（クレジット無しとして扱う） */
+  }
+  return c.json({ credits });
+});
+
 // ============================ 状態（監視・デバッグ用） ============================
 /**
  * GET /api/meta/status

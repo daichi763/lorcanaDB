@@ -275,6 +275,8 @@ app.get('/deck', (c) =>
         <div id="meta-recipes-list" class="grid gap-3 md:grid-cols-2"></div>
         <div id="meta-recipes-more" class="mt-3"></div>
         <div id="meta-recipe-detail" class="mt-4"></div>
+        {/* 帰属表示（利用規約で可視クレジットが必須のデータ提供元） */}
+        <div id="meta-credits" class="mt-4"></div>
       </section>
 
       <div id="lightbox" role="dialog" aria-modal="true" aria-label="カード画像拡大">
@@ -503,6 +505,9 @@ app.get('/meta', (c) =>
 
       {/* 公式リンク集 */}
       <section id="meta-links" class="my-5" aria-label="公式情報リンク"></section>
+
+      {/* 帰属表示（利用規約で可視クレジットが必須のデータ提供元） */}
+      <section id="meta-credits" class="my-5" aria-label="データ提供元"></section>
 
       <footer class="mt-6 pt-4 border-t border-slate-700 text-xs text-slate-400 space-y-1.5">
         <p>

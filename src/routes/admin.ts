@@ -487,8 +487,12 @@ admin.post('/meta/collect', async (c) => {
 
   const jobId = await openJob(db, 'collect');
   const started = Date.now();
-  // X 公式APIは有料プラン前提。X_BEARER_TOKEN が未設定なら collectOne 側でスキップされる
-  const out = await collectOne(db, target, { xToken: (c.env as any).X_BEARER_TOKEN });
+  // X 公式APIは有料プラン前提。TopDeck.gg も APIキー必須（かつ可視クレジット必須）。
+  // どちらも未設定なら collectOne 側で「スキップ（成功扱い）」になるので日次ジョブは落ちない。
+  const out = await collectOne(db, target, {
+    xToken: (c.env as any).X_BEARER_TOKEN,
+    topdeckKey: (c.env as any).TOPDECK_API_KEY,
+  });
   const elapsed = Date.now() - started;
 
   await closeJob(db, jobId, {

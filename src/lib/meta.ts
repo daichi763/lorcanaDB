@@ -1537,6 +1537,125 @@ export async function collectSitemapRecent(
   return { status: 200, found: entries.length, ...res };
 }
 
+// ============================ 収集: TopDeck.gg 大会API ============================
+
+/**
+ * TopDeck.gg の大会データを取得する。
+ *
+ * 【利用条件】無料だが Attribution Required（可視クレジットとリンクが必須）。
+ * meta_sources.requires_credit=1 / credit_label / credit_url を持たせ、
+ * フロントの帰属表示欄に常時クレジットを出すことで条件を満たす。
+ * この扱いは仕様§1.3の明示的な例外（デッキレシピ欄と同様）。
+ *
+ * 【API仕様（実測）】
+ *   POST https://topdeck.gg/api/v2/tournaments
+ *   Authorization: <API_KEY>（Bearer ではなく生のキー）
+ *   body: { game, format, last, columns, participantMin }
+ *   レート制限: 概ね 100 req/min（bulk はより低い）
+ */
+export async function collectTopdeck(
+  db: D1Database,
+  src: SourceRow,
+  apiKey: string,
+  opts: { days?: number; minPlayers?: number; maxEvents?: number } = {}
+): Promise<{ status: number; events: number; decks: number } & UpsertResult> {
+  const empty = { inserted: 0, updated: 0, unchanged: 0 };
+  const days = Math.max(1, Math.min(30, opts.days ?? 10));
+  const minPlayers = opts.minPlayers ?? 16;
+  const maxEvents = Math.max(1, Math.min(40, opts.maxEvents ?? 15));
+
+  const r = await politeFetch(src.url, {
+    method: 'POST',
+    headers: { Authorization: apiKey, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      game: 'Lorcana',
+      format: 'Core Constructed',
+      last: days,
+      participantMin: minPlayers,
+      // standings は上位のみで十分。decklist を含めてアーキタイプ判定に使う
+      columns: ['name', 'decklist', 'wins', 'losses'],
+    }),
+    timeoutMs: 25_000,
+  });
+
+  if (r.status !== 200) {
+    await markSource(db, src.key, r.status, `http ${r.status}`);
+    return { status: r.status, events: 0, decks: 0, ...empty };
+  }
+
+  let list: any[] = [];
+  try {
+    const j = JSON.parse(r.text);
+    list = Array.isArray(j) ? j : Array.isArray(j?.data) ? j.data : [];
+  } catch {
+    await markSource(db, src.key, 200, 'invalid json');
+    return { status: 200, events: 0, decks: 0, ...empty };
+  }
+
+  const items: RawItem[] = [];
+  const eventStmts: D1PreparedStatement[] = [];
+  let decks = 0;
+
+  for (const t of list.slice(0, maxEvents)) {
+    const tid = String(t?.TID ?? t?.id ?? t?.tid ?? '');
+    const name = String(t?.tournamentName ?? t?.name ?? '').trim();
+    if (!tid || !name) continue;
+
+    // startDate は秒 or ミリ秒の epoch で来ることがあるため両対応
+    const rawDate = t?.startDate ?? t?.date ?? null;
+    let held: string | null = null;
+    if (rawDate != null) {
+      const n = Number(rawDate);
+      held = Number.isFinite(n)
+        ? new Date(n > 1e12 ? n : n * 1000).toISOString().slice(0, 10)
+        : dateOnly(String(rawDate));
+    }
+
+    const standings: any[] = Array.isArray(t?.standings) ? t.standings : [];
+    const players = Number(t?.participantCount ?? t?.players ?? standings.length) || standings.length;
+    const url = `https://topdeck.gg/event/${encodeURIComponent(tid)}`;
+
+    // raw_items へ（要約の材料）。本文は持たず、数値と名称のみ
+    items.push({
+      url,
+      title: name.slice(0, 160),
+      excerpt: `${held ?? ''} / 参加${players}人`.trim(),
+      observed_at: held,
+      kind: 'event',
+      meta: { platform: 'topdeck', tid, players },
+    });
+
+    // meta_events へ（大会結果として表示）
+    eventStmts.push(
+      db.prepare(
+        `INSERT INTO meta_events
+           (event_key, name, region, scale, held_on, players, format, source_url,
+            is_official, is_upcoming, note, observed_at, fetched_at, updated_at)
+         VALUES (?,?,'en',?,?,?,'Core Constructed',?,0,0,?,?,datetime('now'),datetime('now'))
+         ON CONFLICT(event_key) DO UPDATE SET
+           name=excluded.name, players=excluded.players, held_on=excluded.held_on,
+           observed_at=excluded.observed_at, updated_at=datetime('now')`
+      ).bind(
+        `topdeck:${tid}`,
+        name.slice(0, 160),
+        players >= 128 ? 'major' : players >= 32 ? 'challenge' : 'local',
+        held,
+        players,
+        url,
+        // クレジット必須ソースであることを note に残す
+        'TopDeck.gg 提供データ',
+        held
+      )
+    );
+    decks += standings.filter((s) => s?.decklist).length;
+  }
+
+  if (eventStmts.length) await runBatched(db, eventStmts, 30);
+  const res = await upsertRawItems(db, src, items);
+  await markSource(db, src.key, 200);
+  return { status: 200, events: eventStmts.length, decks, ...res };
+}
+
 // ============================ 収集: X 公式API（課金前提） ============================
 
 /**
@@ -1636,10 +1755,11 @@ export async function collectXCommunity(
 export async function collectOne(
   db: D1Database,
   src: SourceRow,
-  opts: { xToken?: string } = {}
+  opts: { xToken?: string; topdeckKey?: string } = {}
 ): Promise<CollectOutcome> {
   const base = { source: src.key, label: src.label };
   const xToken = opts.xToken?.trim() || '';
+  const topdeckKey = opts.topdeckKey?.trim() || '';
   try {
     switch (src.key) {
       case 'takaratomy_news': {
@@ -1714,6 +1834,20 @@ export async function collectOne(
           detail: { found: r.found },
         };
       }
+      case 'topdeck_gg': {
+        if (!topdeckKey) {
+          return {
+            ...base, ok: true, status: 0, inserted: 0, updated: 0,
+            detail: { skipped: 'no_topdeck_api_key' },
+          };
+        }
+        const r = await collectTopdeck(db, src, topdeckKey, { days: 10, minPlayers: 16 });
+        return {
+          ...base, ok: r.status === 200, status: r.status,
+          inserted: r.inserted, updated: r.updated,
+          detail: { events: r.events, decks_with_list: r.decks },
+        };
+      }
       default: {
         // X 公式API。トークン未設定なら「未課金」としてスキップ（失敗扱いにしない）
         if (src.method === 'x_api') {
@@ -1783,5 +1917,6 @@ export const COLLECT_ORDER = [
   'note_disney_lorcana',
   'tcgcontender',
   'elorcana',
+  'topdeck_gg',
   'x_community_jp',
 ] as const;

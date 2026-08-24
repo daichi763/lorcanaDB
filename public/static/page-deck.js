@@ -664,6 +664,12 @@ window.initDeckPage = function () {
 
     loadRecipes(false);
 
+    // 帰属表示（利用規約で可視クレジットが必須のデータ提供元）。
+    // page-meta.js が先に読み込まれていれば window.LorMeta.renderCredits が使える。
+    try {
+      window.LorMeta?.renderCredits?.('meta-credits');
+    } catch (_) { /* クレジット欄は表示できなくても本体は動かす */ }
+
     // /deck?meta=<id> で直接開かれた場合
     const want = new URLSearchParams(location.search).get('meta');
     if (want) {

@@ -45,6 +45,14 @@ export const OFFICIAL_HOSTS = [
 /**
  * 本文中に出てはいけない非公式ソース名。
  * 「〜によると」の形で残ると仕様§1.3違反になるため、名前ごと削除する。
+ *
+ * 【例外について】
+ * 利用規約で可視クレジットが必須のソース（meta_sources.requires_credit=1、
+ * 現時点では TopDeck.gg）は、このリストに **意図的に載せていない**。
+ * ただし本文へ混ぜるのではなく、フロントの専用の帰属表示欄
+ * （GET /api/meta/credits → 「Data provided by TopDeck.gg」）で規約を満たす。
+ * 本文の文体は§1.3のまま（集約表現）を保つ、という分離方針。
+ * なお topdeck.gg の URL は非公式ドメイン扱いなので本文からは従来どおり除去される。
  */
 const UNOFFICIAL_TOKENS = [
   'disneylorcana.jp',

@@ -345,6 +345,9 @@
 
     // ---- デッキレシピ ----
     renderDecks();
+
+    // ---- 帰属表示（可視クレジット必須のデータ提供元）----
+    renderCredits('meta-credits');
   }
 
   function topicsHtml(topics) {
@@ -499,6 +502,59 @@
     host.innerHTML = html;
   }
 
+  /**
+   * 帰属表示欄（仕様§1.3 の例外）。
+   *
+   * 通常、非公式ソースは表示上クレジットしない（§1.3）。
+   * ただし利用規約で「可視クレジットとリンクバック」が必須のデータ提供元
+   * （TopDeck.gg の Attribution Required など）は、デッキレシピ欄と同じ扱いの
+   * 例外として、この専用欄に常時掲出する。
+   * まとめ本文には混ぜない（本文の文体は§1.3のまま集約表現を保つ）。
+   *
+   * ここは isOfficial() の検査を意図的に通さない。規約上リンクが必須のため。
+   * 表示するのは /api/meta/credits が返すラベルとURLのみ（記事本文は扱わない）。
+   */
+  async function renderCredits(elId) {
+    const host = document.getElementById(elId || 'meta-credits');
+    if (!host) return;
+    let d;
+    try {
+      d = await apiGet('/api/meta/credits');
+    } catch (_) {
+      host.innerHTML = '';
+      return;
+    }
+    const list = (d && d.credits) || [];
+    if (!list.length) {
+      host.innerHTML = '';
+      return;
+    }
+    host.innerHTML = card(
+      `<h2 class="text-xs font-bold mb-1.5 flex items-center gap-1.5">` +
+        `<i class="fas fa-database text-slate-400"></i>データ提供元</h2>` +
+        `<ul class="space-y-1">` +
+        list
+          .map(function (cr) {
+            const label = esc(cr.label || '');
+            const url = String(cr.url || '');
+            const link = url
+              ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer"` +
+                ` class="text-sky-400 hover:text-sky-300 underline">${label}` +
+                `<i class="fas fa-external-link-alt ml-1 text-[9px]"></i></a>`
+              : label;
+            return (
+              `<li class="text-[11px] text-slate-400">` +
+              `Tournament data provided by ${link}` +
+              `<span class="ml-1 text-slate-500">（大会データの一部は ${label} 提供）</span>` +
+              `</li>`
+            );
+          })
+          .join('') +
+        `</ul>`,
+      'p-2.5'
+    );
+  }
+
   async function renderSnapshot(region, elId, title) {
     const host = document.getElementById(elId);
     if (!host) return;
@@ -598,5 +654,5 @@
   window.initMetaWidget = initMetaWidget;
   window.initMetaPage = initMetaPage;
   // デッキタブから再利用する
-  window.LorMeta = { deckCardHtml, inkChip, isOfficial, fmtDate, fmtDateFull, cardLink };
+  window.LorMeta = { deckCardHtml, inkChip, isOfficial, fmtDate, fmtDateFull, cardLink, renderCredits };
 })();
