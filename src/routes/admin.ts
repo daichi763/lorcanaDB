@@ -487,7 +487,8 @@ admin.post('/meta/collect', async (c) => {
 
   const jobId = await openJob(db, 'collect');
   const started = Date.now();
-  const out = await collectOne(db, target);
+  // X 公式APIは有料プラン前提。X_BEARER_TOKEN が未設定なら collectOne 側でスキップされる
+  const out = await collectOne(db, target, { xToken: (c.env as any).X_BEARER_TOKEN });
   const elapsed = Date.now() - started;
 
   await closeJob(db, jobId, {

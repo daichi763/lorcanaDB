@@ -64,21 +64,33 @@ meta.get('/snapshot', async (c) => {
   const limit = num(c.req.query('limit'), 8, 40);
 
   try {
+    // 同じ窓に複数の由来（初期シード / 実測集計 / 自前デッキ集計）が同居しうる。
+    // 混ぜると同じインクペアが二重に出て数値が矛盾するので、
+    // 「最も新しく計算された1系統」だけを選び、その detail を丸ごと返す。
     const head = await c.env.DB.prepare(
-      `SELECT window_from, window_to, computed_at FROM meta_snapshots
-        WHERE region = ? AND kind = ? ORDER BY window_to DESC, id DESC LIMIT 1`
+      `SELECT window_from, window_to, computed_at, detail FROM meta_snapshots
+        WHERE region = ? AND kind = ? ORDER BY computed_at DESC, id DESC LIMIT 1`
     )
       .bind(region, kind)
-      .first<{ window_from: string; window_to: string; computed_at: string }>();
+      .first<{ window_from: string; window_to: string; computed_at: string; detail: string | null }>();
     if (!head) return c.json({ region, kind, window: null, rows: [] });
+
+    // 選ばれた系統の識別子。detail.source が無い場合は空文字として扱う
+    let headSource = '';
+    try {
+      headSource = String((JSON.parse(String(head.detail ?? '{}')) || {}).source ?? '');
+    } catch {
+      headSource = '';
+    }
 
     const rows = await c.env.DB.prepare(
       `SELECT label, deck_count, weighted, share, rank, share_delta, detail
          FROM meta_snapshots
         WHERE region = ? AND kind = ? AND window_to = ?
+          AND (? = '' OR detail LIKE ?)
         ORDER BY rank ASC LIMIT ?`
     )
-      .bind(region, kind, head.window_to, limit)
+      .bind(region, kind, head.window_to, headSource, `%"${headSource}"%`, limit)
       .all();
 
     return c.json({

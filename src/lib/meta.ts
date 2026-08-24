@@ -130,6 +130,12 @@ export type SourceRow = {
   last_error?: string | null;
   fail_streak?: number;
   checked_at?: string | null;
+  // 規約情報（0007で追加）。content_signal に ai-train=no があるサイトは
+  // 記憶層への恒久保存を避けるため allow_memory=0 で運用する
+  content_signal?: string | null;
+  allow_memory?: number;
+  requires_secret?: string | null;
+  note?: string | null;
 };
 
 export async function loadSources(db: D1Database, keys?: string[]): Promise<SourceRow[]> {
@@ -1334,8 +1340,306 @@ export type CollectOutcome = {
 };
 
 /** 1ソースを収集する。ソース種別に応じて適切なコレクタへ振り分ける */
-export async function collectOne(db: D1Database, src: SourceRow): Promise<CollectOutcome> {
+// ============================ 収集: 海外メタ集計（Lorcana Hunter） ============================
+
+/** 英語インク名 → 日本語（フランス語表記も来るため両方受ける） */
+const INK_I18N: Record<string, string> = {
+  amber: 'アンバー', ambre: 'アンバー',
+  amethyst: 'アメジスト', amethyste: 'アメジスト', améthyste: 'アメジスト',
+  emerald: 'エメラルド', emeraude: 'エメラルド', émeraude: 'エメラルド',
+  ruby: 'ルビー', rubis: 'ルビー',
+  sapphire: 'サファイア', saphir: 'サファイア',
+  steel: 'スティール', acier: 'スティール',
+};
+
+export function inkToJa(raw: string): string | null {
+  const k = raw.trim().toLowerCase().replace(/[^a-zéè]/g, '');
+  return INK_I18N[k] ?? null;
+}
+
+/**
+ * インク画像のファイル名からインクを判定する。
+ * 例: /assets/images/dlc_ink_amber-mSixmFc.webp → アンバー
+ * alt 属性はロケール依存（Ambre / Amber）だがファイル名は英語固定なので、
+ * ファイル名を第一候補、alt を第二候補にする。
+ */
+function inkFromImg(tag: string): string | null {
+  const src = tag.match(/src="([^"]+)"/)?.[1] ?? '';
+  const byFile = src.match(/dlc_ink_([a-z]+)/i)?.[1];
+  if (byFile) {
+    const ja = inkToJa(byFile);
+    if (ja) return ja;
+  }
+  const alt = tag.match(/alt="([^"]+)"/)?.[1] ?? '';
+  return alt ? inkToJa(alt) : null;
+}
+
+export type MetaShareRow = { label: string; share: number; top8: number | null; decks: number };
+
+/**
+ * Lorcana Hunter の /en/meta をパースして、バイカラー別のメタシェアを取り出す。
+ *
+ * 1カード = 1バイカラーの `mf-bico-card` ブロック。
+ * ブロック内に dlc_ink_*.webp が2つ（インクペア）、Meta% / Top 8 % / N decks がある。
+ * 「集計値（数値）」だけを取り、記事本文は一切取らないので再配信にならない。
+ */
+export function parseLhMeta(html: string): MetaShareRow[] {
+  const out: MetaShareRow[] = [];
+  const blocks = html.split('mf-bico-card').slice(1);
+  for (const b of blocks) {
+    const inks: string[] = [];
+    for (const m of b.matchAll(/<img[^>]*mf-ink-icon[^>]*>/g)) {
+      const ja = inkFromImg(m[0]);
+      if (ja && !inks.includes(ja)) inks.push(ja);
+    }
+    if (inks.length < 1) continue;
+
+    // Meta の直後の値 → share、Top 8 の直後の値 → top8
+    const pct = [...b.matchAll(/mf-stat-label">\s*([^<]+?)\s*<\/span>\s*<span class="mf-stat-val">\s*([\d.]+)%/g)];
+    let share: number | null = null;
+    let top8: number | null = null;
+    for (const p of pct) {
+      const label = p[1].toLowerCase();
+      const v = Number(p[2]);
+      if (!Number.isFinite(v)) continue;
+      if (share === null && /^meta/.test(label)) share = v;
+      else if (top8 === null && /top\s*8/.test(label)) top8 = v;
+    }
+    if (share === null) continue;
+
+    const decks = Number(b.match(/([\d,]+)\s*decks?/i)?.[1]?.replace(/,/g, '') ?? '0') || 0;
+    const label = inks.slice(0, 2).join('/');
+    // 同じインクペアが Core/Infinity で複数出るので、最初（=Core）のみ採用
+    if (out.some((r) => r.label === label)) continue;
+    out.push({ label, share, top8, decks });
+  }
+  return out;
+}
+
+/**
+ * 海外メタシェアを meta_snapshots に直接書き込む。
+ *
+ * computeSnapshots（自前デッキ集計）とは別枠。detail.source で由来を残し、
+ * どちらの数値なのかがフロント・LLM双方で判別できるようにする。
+ * 仕様§5「数値はクロスチェック」のための第2の観測系。
+ */
+export async function collectLhMeta(
+  db: D1Database,
+  src: SourceRow,
+  opts: { days?: number } = {}
+): Promise<{ status: number; rows: number }> {
+  const days = opts.days ?? 30;
+  const r = await politeFetch(src.url);
+  if (r.status !== 200) {
+    await markSource(db, src.key, r.status, `http ${r.status}`);
+    return { status: r.status, rows: 0 };
+  }
+  const rows = parseLhMeta(r.text);
+  if (!rows.length) {
+    await markSource(db, src.key, 200, 'parse produced 0 rows');
+    return { status: 200, rows: 0 };
+  }
+
+  const to = jstToday();
+  const from = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10);
+  const stmts: D1PreparedStatement[] = [
+    // 同一窓・同一由来の前回分を消してから入れ直す（重複行を作らない）
+    db.prepare(
+      `DELETE FROM meta_snapshots
+        WHERE region='en' AND kind='ink_pair' AND window_to=? AND detail LIKE '%"lh_meta"%'`
+    ).bind(to),
+  ];
+  rows.sort((a, b) => b.share - a.share);
+  rows.forEach((row, i) => {
+    stmts.push(
+      db.prepare(
+        `INSERT INTO meta_snapshots
+           (region, window_from, window_to, kind, label, deck_count, weighted, share, rank, detail, computed_at)
+         VALUES ('en',?,?,'ink_pair',?,?,?,?,?,?,datetime('now'))`
+      ).bind(
+        from, to, row.label, row.decks, row.decks, row.share, i + 1,
+        JSON.stringify({ source: 'lh_meta', top8: row.top8, days })
+      )
+    );
+  });
+  await runBatched(db, stmts, 40);
+  await markSource(db, src.key, 200);
+  return { status: 200, rows: rows.length };
+}
+
+// ============================ 収集: 汎用 sitemap（直近分のみ） ============================
+
+/**
+ * sitemap.xml / sitemapindex から lastmod が新しい URL のみを raw_items に入れる。
+ *
+ * ・本文は取得しない（URL とタイトル代替のスラッグのみ）。
+ *   → ai-train=no のサイトでも「参照」の範囲に収まる
+ * ・sitemapindex なら子 sitemap を1つだけ辿る（CPU上限対策）
+ */
+export async function collectSitemapRecent(
+  db: D1Database,
+  src: SourceRow,
+  opts: { maxItems?: number; days?: number; pathFilter?: RegExp } = {}
+): Promise<{ status: number; found: number } & UpsertResult> {
+  const maxItems = Math.max(1, Math.min(60, opts.maxItems ?? 20));
+  const days = opts.days ?? 14;
+  const empty = { inserted: 0, updated: 0, unchanged: 0 };
+
+  let target = src.url;
+  let r = await politeFetch(target);
+  if (r.status !== 200) {
+    await markSource(db, src.key, r.status, `http ${r.status}`);
+    return { status: r.status, found: 0, ...empty };
+  }
+
+  // sitemapindex の場合、pathFilter に合う子（なければ最後の子）を1つ辿る
+  if (/<sitemapindex/i.test(r.text)) {
+    const kids = [...r.text.matchAll(/<loc>([^<]+)<\/loc>/g)].map((m) => m[1].trim());
+    const pick = opts.pathFilter ? kids.find((k) => opts.pathFilter!.test(k)) : undefined;
+    target = pick ?? kids[kids.length - 1] ?? '';
+    if (!target) {
+      await markSource(db, src.key, 200, 'sitemapindex had no children');
+      return { status: 200, found: 0, ...empty };
+    }
+    await politeSleep();
+    r = await politeFetch(target);
+    if (r.status !== 200) {
+      await markSource(db, src.key, r.status, `child sitemap http ${r.status}`);
+      return { status: r.status, found: 0, ...empty };
+    }
+  }
+
+  const cutoff = new Date(Date.now() - days * 86400_000).toISOString().slice(0, 10);
+  const entries: Array<{ url: string; lastmod: string | null }> = [];
+  for (const m of r.text.matchAll(/<url>([\s\S]*?)<\/url>/g)) {
+    const block = m[1];
+    const loc = block.match(/<loc>([^<]+)<\/loc>/)?.[1]?.trim();
+    if (!loc) continue;
+    if (opts.pathFilter && !opts.pathFilter.test(loc)) continue;
+    entries.push({ url: loc, lastmod: dateOnly(block.match(/<lastmod>([^<]+)<\/lastmod>/)?.[1]) });
+  }
+  // lastmod 降順。日付なしは後回し
+  entries.sort((a, b) => String(b.lastmod ?? '').localeCompare(String(a.lastmod ?? '')));
+
+  const items: RawItem[] = [];
+  for (const e of entries) {
+    if (items.length >= maxItems) break;
+    if (e.lastmod && e.lastmod < cutoff) break;
+    // スラッグをタイトル代替にする（本文は取らない）
+    const slug = e.url.replace(/\/+$/, '').split('/').pop() ?? '';
+    const title = slug.replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()).slice(0, 160);
+    if (!title) continue;
+    items.push({ url: e.url, title, excerpt: '', observed_at: e.lastmod });
+  }
+
+  const res = await upsertRawItems(db, src, items);
+  await markSource(db, src.key, 200);
+  return { status: 200, found: entries.length, ...res };
+}
+
+// ============================ 収集: X 公式API（課金前提） ============================
+
+/**
+ * X（旧Twitter）公式API v2 からポストを取得する。
+ *
+ * 【前提】x.com/robots.txt は `User-agent: * / Disallow: /`（全面禁止）。
+ * スクレイピングは不可なので、収集経路は公式API（有料プラン）のみに限定する。
+ * X_BEARER_TOKEN が未設定なら収集自体を行わず 'no_token' を返す（課金前は自動スキップ）。
+ *
+ * 【§1.3への配慮】
+ * ・公式アカウント（DisneyLOR_JP / DisneyLorcana）は citable=1 として出典リンク可
+ * ・非公式アカウントは citable=0。本文を丸ごと保存すると逐語引用の温床になるため
+ *   excerpt を 200字に切り、要約の材料としてのみ使う（記憶層にも入れない）
+ */
+export const X_COMMUNITY_USERS = [
+  'samemau_lorcana', 'jspd_', 'lorhappy_tcg', 'pika0765', 'doomdozer2826sv',
+] as const;
+
+type XPost = { id: string; text: string; created_at?: string; author?: string };
+
+async function xApi(
+  token: string,
+  path: string,
+  params: Record<string, string>
+): Promise<{ status: number; json: any }> {
+  const qs = new URLSearchParams(params).toString();
+  const r = await politeFetch(`https://api.x.com/2/${path}${qs ? `?${qs}` : ''}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  let json: any = null;
+  try { json = JSON.parse(r.text); } catch { /* HTML エラーページ等 */ }
+  return { status: r.status, json };
+}
+
+export async function collectXUser(
+  db: D1Database,
+  src: SourceRow,
+  token: string,
+  username: string,
+  opts: { maxPosts?: number } = {}
+): Promise<{ status: number } & UpsertResult> {
+  const empty = { inserted: 0, updated: 0, unchanged: 0 };
+  const u = await xApi(token, `users/by/username/${encodeURIComponent(username)}`, {});
+  if (u.status !== 200 || !u.json?.data?.id) {
+    await markSource(db, src.key, u.status, `user lookup ${u.status}`);
+    return { status: u.status, ...empty };
+  }
+  await politeSleep();
+  const t = await xApi(token, `users/${u.json.data.id}/tweets`, {
+    max_results: String(Math.max(5, Math.min(100, opts.maxPosts ?? 10))),
+    'tweet.fields': 'created_at,entities',
+    exclude: 'retweets,replies',
+  });
+  if (t.status !== 200) {
+    await markSource(db, src.key, t.status, `timeline ${t.status}`);
+    return { status: t.status, ...empty };
+  }
+
+  const posts: XPost[] = (t.json?.data ?? []) as XPost[];
+  const items: RawItem[] = posts
+    .filter((p) => p.id && p.text)
+    .map((p) => ({
+      url: `https://x.com/${username}/status/${p.id}`,
+      // タイトルは1行目。ポスト全文はタイトルにしない
+      title: p.text.split('\n')[0].slice(0, 120) || `@${username} のポスト`,
+      // 非公式は 200字、公式は 400字。いずれも本文全体は保存しない
+      excerpt: p.text.slice(0, src.is_official ? 400 : 200),
+      observed_at: dateOnly(p.created_at),
+      meta: { platform: 'x', username, post_id: p.id },
+    }));
+
+  const res = await upsertRawItems(db, src, items);
+  await markSource(db, src.key, 200);
+  return { status: 200, ...res };
+}
+
+export async function collectXCommunity(
+  db: D1Database,
+  src: SourceRow,
+  token: string,
+  opts: { maxPerUser?: number; users?: readonly string[] } = {}
+): Promise<{ status: number; users: number } & UpsertResult> {
+  const users = opts.users ?? X_COMMUNITY_USERS;
+  const acc = { inserted: 0, updated: 0, unchanged: 0 };
+  let status = 200;
+  let done = 0;
+  for (const name of users) {
+    const r = await collectXUser(db, src, token, name, { maxPosts: opts.maxPerUser ?? 5 });
+    acc.inserted += r.inserted; acc.updated += r.updated; acc.unchanged += r.unchanged;
+    if (r.status !== 200) { status = r.status; break; }
+    done++;
+    await politeSleep();
+  }
+  return { status, users: done, ...acc };
+}
+
+export async function collectOne(
+  db: D1Database,
+  src: SourceRow,
+  opts: { xToken?: string } = {}
+): Promise<CollectOutcome> {
   const base = { source: src.key, label: src.label };
+  const xToken = opts.xToken?.trim() || '';
   try {
     switch (src.key) {
       case 'takaratomy_news': {
@@ -1376,7 +1680,73 @@ export async function collectOne(db: D1Database, src: SourceRow): Promise<Collec
         const r = await collectJpPosts(db, src, { maxPosts: 6 });
         return { ...base, ok: true, status: r.status, inserted: r.inserted, updated: r.updated };
       }
+      case 'lh_meta': {
+        // 集計数値のみを取得し meta_snapshots へ直接書く（raw_items は使わない）
+        const r = await collectLhMeta(db, src, { days: 30 });
+        return {
+          ...base, ok: r.rows > 0, status: r.status, inserted: r.rows, updated: 0,
+          detail: { snapshot_rows: r.rows },
+          error: r.rows > 0 ? undefined : 'no_rows_parsed',
+        };
+      }
+      case 'lh_tournaments': {
+        const r = await collectSitemapRecent(db, src, {
+          maxItems: 20, days: 10, pathFilter: /\/tournament\//,
+        });
+        return {
+          ...base, ok: true, status: r.status, inserted: r.inserted, updated: r.updated,
+          detail: { found: r.found },
+        };
+      }
+      case 'tcgcontender': {
+        const r = await collectSitemapRecent(db, src, { maxItems: 12, days: 14 });
+        return {
+          ...base, ok: true, status: r.status, inserted: r.inserted, updated: r.updated,
+          detail: { found: r.found },
+        };
+      }
+      case 'elorcana': {
+        const r = await collectSitemapRecent(db, src, {
+          maxItems: 12, days: 14, pathFilter: /\/(tournament|tournaments|event)/,
+        });
+        return {
+          ...base, ok: true, status: r.status, inserted: r.inserted, updated: r.updated,
+          detail: { found: r.found },
+        };
+      }
       default: {
+        // X 公式API。トークン未設定なら「未課金」としてスキップ（失敗扱いにしない）
+        if (src.method === 'x_api') {
+          if (!xToken) {
+            return {
+              ...base, ok: true, status: 0, inserted: 0, updated: 0,
+              detail: { skipped: 'no_x_bearer_token' },
+            };
+          }
+          if (src.key === 'x_community_jp') {
+            const r = await collectXCommunity(db, src, xToken, { maxPerUser: 5 });
+            return {
+              ...base, ok: r.status === 200, status: r.status,
+              inserted: r.inserted, updated: r.updated, detail: { users: r.users },
+            };
+          }
+          const uname = src.url.match(/by\/username\/([A-Za-z0-9_]+)/)?.[1];
+          if (!uname) {
+            return { ...base, ok: false, status: 0, inserted: 0, updated: 0, error: 'no_username_in_url' };
+          }
+          const r = await collectXUser(db, src, xToken, uname, { maxPosts: 10 });
+          return {
+            ...base, ok: r.status === 200, status: r.status,
+            inserted: r.inserted, updated: r.updated, detail: { username: uname },
+          };
+        }
+        if (src.method === 'blocked') {
+          // robots で収集不可と判定済みのソース。記録のみで実行しない
+          return {
+            ...base, ok: true, status: 0, inserted: 0, updated: 0,
+            detail: { skipped: 'blocked_by_robots' },
+          };
+        }
         if (src.method === 'rss') {
           const r = await collectRss(db, src);
           return { ...base, ok: true, status: r.status, inserted: r.inserted, updated: r.updated };
@@ -1392,16 +1762,26 @@ export async function collectOne(db: D1Database, src: SourceRow): Promise<Collec
   }
 }
 
-/** 収集の実行順。1リクエストで回す本数は呼び出し側が決める */
+/**
+ * 収集の実行順。1リクエストで回す本数は呼び出し側が決める。
+ * 公式・鮮度の高いものを先に置き、途中で打ち切られても重要な情報が落ちないようにする。
+ */
 export const COLLECT_ORDER = [
   'takaratomy_news',
   'takaratomy_column',
   'takaratomy_event',
+  'x_official_jp',
+  'x_official_en',
   'lorcana_en_recap',
   'lorcana_en_news',
   'jp_community_deck',
   'jp_community_post',
+  'lh_meta',
+  'lh_tournaments',
   'note_lorcana',
   'note_lorcana_deck',
   'note_disney_lorcana',
+  'tcgcontender',
+  'elorcana',
+  'x_community_jp',
 ] as const;
