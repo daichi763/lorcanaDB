@@ -43,6 +43,7 @@ import {
   collectOne,
   computeSnapshots,
   extractJpEvents,
+  jstDateOf,
   jstToday,
   loadSources,
   openJob,
@@ -474,8 +475,16 @@ admin.post('/meta/collect', async (c) => {
   for (const key of order) {
     const s = byKey.get(key);
     if (!s || !s.enabled) continue;
+    // last_ok_at / checked_at は D1 の datetime('now')＝UTC。JST日付に直してから比較する
+    // （直接比較すると JST 0:00〜9:00 の間は永遠に「未収集」と判定されてループする）
+    //
+    // checked_at も見るのは、失敗したソースを無限に選び直さないため。
+    // 「今日1回でも試した」なら次へ進み、その日の再挑戦は明示的な reset/source 指定に任せる。
     const doneToday =
-      !reset && !only && s.last_ok_at ? String(s.last_ok_at).slice(0, 10) >= today : false;
+      !reset && !only
+        ? (s.last_ok_at ? jstDateOf(s.last_ok_at) >= today : false) ||
+          (s.checked_at ? jstDateOf(s.checked_at) >= today : false)
+        : false;
     if (doneToday) continue;
     if (!target) target = s;
     else pending.push(key);
@@ -698,15 +707,22 @@ admin.get('/meta/status', async (c) => {
        FROM meta_raw_items GROUP BY source_key ORDER BY n DESC`
   );
 
-  const collectedToday = sources.filter(
-    (s) => s.last_ok_at && String(s.last_ok_at).slice(0, 10) >= today
+  // 母数は「日次収集の対象（COLLECT_ORDER にあり、かつ有効）」に限定する。
+  // 例: lorcast_api は enabled=1 だがカードデータ参照専用でコレクタを持たないため、
+  //     全有効ソースを母数にすると永遠に 18/19 と表示され「失敗が1件ある」ように見えてしまう。
+  const collectKeys = new Set(COLLECT_ORDER as readonly string[]);
+  const targets = sources.filter(
+    (s) => Number(s.enabled ?? 1) && collectKeys.has(String(s.key))
+  );
+  const collectedToday = targets.filter(
+    (s) => s.last_ok_at && jstDateOf(s.last_ok_at) >= today
   ).length;
 
   return c.json({
     today,
     counts,
     collected_today: collectedToday,
-    source_total: sources.filter((s) => Number(s.enabled ?? 1)).length,
+    source_total: targets.length,
     sources,
     jobs,
     reports,

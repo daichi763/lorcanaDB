@@ -93,6 +93,23 @@ export function jstNow(): string {
   return new Date(Date.now() + 9 * 3600_000).toISOString().replace('T', ' ').slice(0, 16);
 }
 
+/**
+ * D1 に `datetime('now')` で入った **UTC** 文字列を JST の日付（YYYY-MM-DD）へ変換する。
+ *
+ * これが無いと「今日はもう収集済みか」の判定が壊れる。
+ * `last_ok_at` は UTC、`jstToday()` は JST なので、JST 0:00〜9:00 の間は
+ * 「UTCでは前日」となり、何度収集しても doneToday が成立せず同じソースを
+ * 延々と取り直してしまう（実際にこの時間帯で無限ループを踏んだ）。
+ */
+export function jstDateOf(sqlUtc: unknown): string {
+  const s = String(sqlUtc ?? '').trim();
+  if (!s) return '';
+  // 'YYYY-MM-DD HH:MM:SS'（UTC）を明示的に UTC として解釈する
+  const t = Date.parse(s.replace(' ', 'T') + (/[zZ]|[+-]\d\d:?\d\d$/.test(s) ? '' : 'Z'));
+  if (!Number.isFinite(t)) return s.slice(0, 10);
+  return new Date(t + 9 * 3600_000).toISOString().slice(0, 10);
+}
+
 async function politeFetch(
   url: string,
   init: RequestInit & { timeoutMs?: number } = {}
@@ -1838,6 +1855,10 @@ export async function collectOne(
       }
       case 'topdeck_gg': {
         if (!topdeckKey) {
+          // スキップも「本日は処理済み」として last_ok_at を進める。
+          // これを書かないと collect ループの doneToday が永久に成立せず、
+          // 同じソースを延々と選び直して先へ進まない。
+          await markSource(db, src.key, 200, 'skipped: no_topdeck_api_key');
           return {
             ...base, ok: true, status: 0, inserted: 0, updated: 0,
             detail: { skipped: 'no_topdeck_api_key' },
@@ -1854,6 +1875,8 @@ export async function collectOne(
         // X 公式API。トークン未設定なら「未課金」としてスキップ（失敗扱いにしない）
         if (src.method === 'x_api') {
           if (!xToken) {
+            // スキップも last_ok_at を進める（理由は topdeck_gg 側のコメント参照）
+            await markSource(db, src.key, 200, 'skipped: no_x_bearer_token');
             return {
               ...base, ok: true, status: 0, inserted: 0, updated: 0,
               detail: { skipped: 'no_x_bearer_token' },
@@ -1878,6 +1901,7 @@ export async function collectOne(
         }
         if (src.method === 'blocked') {
           // robots で収集不可と判定済みのソース。記録のみで実行しない
+          await markSource(db, src.key, 200, 'skipped: blocked_by_robots');
           return {
             ...base, ok: true, status: 0, inserted: 0, updated: 0,
             detail: { skipped: 'blocked_by_robots' },
