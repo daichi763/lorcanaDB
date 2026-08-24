@@ -637,6 +637,15 @@ export function buildUserPrompt(args: {
   memoryNotes?: string[];
   /** 意味検索で想起した公式ルールQ&A（公式の公式見解＝最優先の根拠） */
   faqs?: Array<{ category: string; question: string; answer: string; note?: string }>;
+  /**
+   * 記憶層から想起した最新環境情報（メタシェア・大会結果・新セット等）。
+   *
+   * ルールと違い環境情報は「賞味期限がある知識」なので、必ず日付を添えて渡す。
+   * 日付が無いとモデルが古い情報を現在の事実として断定してしまう。
+   */
+  metaContext?: Array<{ title: string; body: string; observed_at?: string | null; scope?: string }>;
+  /** 環境情報の基準日（レポート生成日）。「いつ時点の環境か」を明示するため */
+  metaAsOf?: string | null;
 }): string {
   const parts: string[] = [];
 
@@ -702,6 +711,25 @@ export function buildUserPrompt(args: {
   if (args.memoryNotes?.length) {
     parts.push(
       `## 過去の検討結果（同条件で以前に高評価だった組み合わせ。妥当なら再評価し、誤りと判断すれば採用しなくてよい）\n${args.memoryNotes.join('\n')}`
+    );
+  }
+
+  if (args.metaContext?.length) {
+    // 各項目に「いつ時点の情報か」を必ず添える。日付なしの環境情報は
+    // モデルが現在の確定事実として扱ってしまい、古いメタで断定する事故につながる
+    const lines = args.metaContext.map((m) => {
+      const when = m.observed_at ? `${m.observed_at}時点` : '日付不明';
+      const scope = m.scope ? `[${m.scope}]` : '';
+      return `- ${scope}（${when}）${String(m.title).slice(0, 80)}: ${String(m.body)
+        .replace(/\s+/g, ' ')
+        .slice(0, 300)}`;
+    });
+    parts.push(
+      `## 最新環境情報（${args.metaAsOf ? `${args.metaAsOf} 時点の集計` : '直近の集計'}）
+これは「今の環境で何が強いか」の参考情報であり、**ルールや効果の根拠にはならない**。
+カードの挙動は必ず効果テキストと公式Q&Aで判断すること。
+環境情報を根拠に助言する場合は「${args.metaAsOf ?? '直近'}時点の集計では」のように時点を添えて述べ、
+将来も同じであると断定しない。関連が薄い項目は無視してよい。\n${lines.join('\n')}`
     );
   }
 

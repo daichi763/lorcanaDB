@@ -42,6 +42,7 @@ import {
   vectorsReady,
   type FaqHit,
 } from '../lib/memory';
+import { loadReport, recallMeta } from '../lib/metaReport';
 
 const ai = new Hono<{ Bindings: Bindings }>();
 
@@ -264,6 +265,8 @@ ai.post('/synergy', async (c) => {
     let vectorUsed = false;
     // 公式Q&A の想起結果（クエリ埋め込みを再利用するのでここで受ける）
     let faqHits: FaqHit[] = [];
+    // 最新環境情報の想起結果。カードの挙動の根拠ではなく「今どれが流行っているか」の参考
+    let metaHits: Awaited<ReturnType<typeof recallMeta>> = [];
     try {
       const ready = await vectorsReady(db);
       if (ready.cards > 0) {
@@ -288,11 +291,26 @@ ai.post('/synergy', async (c) => {
           if (ready.faqs > 0) {
             faqHits = await recallFaqs(db, qv, { topK: 6, minSim: 0.28 });
           }
+
+          // 同じベクトルで最新環境情報も想起する。
+          // 環境情報は鮮度が命なので、閾値をやや高め（0.32）にして
+          // 関連の薄い話題がプロンプトに混ざらないようにする。
+          metaHits = await recallMeta(db, qv, { topK: 4, minSim: 0.32 });
         }
       }
     } catch (e: any) {
       // ベクトル検索が落ちても従来の LIKE 検索で動作を継続する（可用性優先）
       console.error('[VECTOR_SKIP]', String(e?.message ?? e).slice(0, 200));
+    }
+
+    // 環境情報の基準日。レポートが無ければ null（プロンプト側で「直近」と表現される）
+    let metaAsOf: string | null = null;
+    if (metaHits.length) {
+      try {
+        metaAsOf = (await loadReport(db))?.report_date ?? null;
+      } catch {
+        metaAsOf = null;
+      }
     }
 
     // ---- 記憶層の利用: 過去の検討結果 ----
@@ -371,6 +389,13 @@ ai.post('/synergy', async (c) => {
         answer: f.answer,
         note: f.note,
       })),
+      metaContext: metaHits.map((m) => ({
+        title: m.title,
+        body: m.body,
+        observed_at: m.observed_at,
+        scope: m.scope,
+      })),
+      metaAsOf: metaAsOf,
     });
 
     const ranked = await chatJson<RankResult>(
@@ -431,6 +456,20 @@ ai.post('/synergy', async (c) => {
         ability_knowledge: abilityKnowledge.length,
         recalled: memoryNotes.length,
         official_faqs: faqHits.length,
+        meta_context: metaHits.length,
+      },
+      // 参照した環境情報（UIで「いつ時点の環境を見たか」を示すため）。
+      // 公式URLは公式ソースのときだけ入っている（仕様§1.3）
+      meta: {
+        as_of: metaAsOf,
+        items: metaHits.map((m) => ({
+          scope: m.scope,
+          title: m.title,
+          observed_at: m.observed_at,
+          region: m.region,
+          official_url: m.official_url,
+          similarity: Math.round(m.sim * 1000) / 1000,
+        })),
       },
       // 参照した公式Q&A（UIで「公式Q&Aを根拠にした」と示すため。本文は短いので全文返す）
       official_faqs: faqHits.map((f) => ({
