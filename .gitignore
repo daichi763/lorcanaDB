@@ -37,3 +37,6 @@ scraper/data/*.sql
 scraper/data/cards.jsonl
 .wrangler/
 dist/
+
+# generated
+worker-configuration.d.ts
