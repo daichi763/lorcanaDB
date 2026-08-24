@@ -37,6 +37,26 @@ import {
   openSession,
   politeSleep,
 } from '../lib/updater';
+import {
+  COLLECT_ORDER,
+  closeJob,
+  collectOne,
+  computeSnapshots,
+  extractJpEvents,
+  jstToday,
+  loadSources,
+  openJob,
+  type SourceRow,
+} from '../lib/meta';
+import {
+  buildKnowledgeRows,
+  embedKnowledge,
+  gatherEvidence,
+  generateReport,
+  loadReport,
+  metaVectorsReady,
+  upsertKnowledge,
+} from '../lib/metaReport';
 
 const admin = new Hono<{ Bindings: Bindings }>();
 
@@ -415,6 +435,278 @@ admin.post('/update/faqs', async (c) => {
   const res = await fetchRuleFaqs(db);
   await log(db, null, 'faqs', 'info', `公式Q&A取得: ${res.fetched}件（新規${res.inserted} / 更新${res.updated}）`, res);
   return c.json(res);
+});
+
+// ---------------------------------------------------------------- 最新環境情報（meta）
+/**
+ * 日次パイプラインの4工程を個別エンドポイントに分けている理由:
+ *   Workers には1リクエストあたりのCPU/実行時間の上限がある。
+ *   「全ソース収集 → 集計 → LLM要約 → ベクトル化」を1回で回すと必ず超える。
+ *   工程を分け、収集はさらに1ソースずつ処理して呼び出し側（cron）が
+ *   順に叩く構造にすることで、途中で失敗しても再開できる。
+ *
+ *   collect（1ソース/回） → aggregate → summarize → memory
+ */
+
+/**
+ * POST /meta/collect  { source?: string, reset?: boolean }
+ *
+ * source 未指定なら「まだ今日収集していないソース」を1つ選んで処理する。
+ * 呼び出し側は done=false の間、同じリクエストを繰り返す。
+ */
+admin.post('/meta/collect', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const only = body?.source ? String(body.source) : '';
+  const reset = Boolean(body?.reset);
+
+  const today = jstToday();
+
+  // 収集対象の決定。COLLECT_ORDER の順に「今日まだ成功していない」ものを探す
+  const all = await loadSources(db);
+  const byKey = new Map(all.map((s) => [s.key, s]));
+  const order = only ? [only] : (COLLECT_ORDER as readonly string[]);
+
+  let target: SourceRow | undefined;
+  const pending: string[] = [];
+  for (const key of order) {
+    const s = byKey.get(key);
+    if (!s || !s.enabled) continue;
+    const doneToday =
+      !reset && !only && s.last_ok_at ? String(s.last_ok_at).slice(0, 10) >= today : false;
+    if (doneToday) continue;
+    if (!target) target = s;
+    else pending.push(key);
+  }
+
+  if (!target) {
+    return c.json({ done: true, remaining: 0, message: '本日分の収集は完了しています' });
+  }
+
+  const jobId = await openJob(db, 'collect');
+  const started = Date.now();
+  const out = await collectOne(db, target);
+  const elapsed = Date.now() - started;
+
+  await closeJob(db, jobId, {
+    status: out.ok ? 'done' : 'failed',
+    ok: out.ok ? 1 : 0,
+    fail: out.ok ? 0 : 1,
+    newItems: out.inserted,
+    message: `${target.label}: ${out.ok ? 'OK' : 'NG'} status=${out.status} 新規${out.inserted} 更新${out.updated}`,
+    detail: { ...out, elapsed_ms: elapsed },
+  });
+  await log(
+    db,
+    jobId,
+    'meta_collect',
+    out.ok ? 'info' : 'error',
+    `環境情報収集 ${target.label}: 新規${out.inserted} / 更新${out.updated}`,
+    out
+  );
+
+  return c.json({
+    done: pending.length === 0,
+    source: out.source,
+    label: out.label,
+    ok: out.ok,
+    status: out.status,
+    inserted: out.inserted,
+    updated: out.updated,
+    detail: out.detail ?? null,
+    error: out.error ?? null,
+    elapsed_ms: elapsed,
+    remaining: pending.length,
+    next: pending[0] ?? null,
+  });
+});
+
+/**
+ * POST /meta/aggregate
+ * 収集済みデータからイベント抽出とメタシェア集計を行う（LLM不使用・決定的）。
+ */
+admin.post('/meta/aggregate', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const jobId = await openJob(db, 'aggregate');
+  try {
+    const ev = await extractJpEvents(db);
+    const jp = await computeSnapshots(db, { region: 'jp', days: 60 });
+    const en = await computeSnapshots(db, { region: 'en', days: 30 });
+    const res = {
+      events: ev.events,
+      jp: { window: [jp.from, jp.to], rows: jp.rows.length },
+      en: { window: [en.from, en.to], rows: en.rows.length },
+    };
+    await closeJob(db, jobId, {
+      status: 'done',
+      ok: 1,
+      message: `集計完了: イベント${ev.events}件 / 日本${jp.rows.length}行 / 海外${en.rows.length}行`,
+      detail: res,
+    });
+    await log(db, jobId, 'meta_aggregate', 'info', '環境情報の集計を更新', res);
+    return c.json({ ok: true, ...res });
+  } catch (e: any) {
+    const msg = String(e?.message ?? e).slice(0, 300);
+    await closeJob(db, jobId, { status: 'failed', fail: 1, message: msg });
+    await log(db, jobId, 'meta_aggregate', 'error', `集計に失敗: ${msg}`);
+    return c.json({ ok: false, error: msg }, 502);
+  }
+});
+
+/**
+ * POST /meta/summarize  { date?: string, dry_run?: boolean }
+ *
+ * LLM要約。失敗しても既存レポートは書き換えない（仕様§6: 前日データを維持）。
+ */
+admin.post('/meta/summarize', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const jobId = await openJob(db, 'summarize');
+  try {
+    const res = await generateReport(c.env, db, {
+      reportDate: body?.date ? String(body.date) : undefined,
+      dryRun: Boolean(body?.dry_run),
+    });
+    // 引用方針違反の除去は「起きたこと」として必ず記録する（黙って直さない）
+    if (res.violations.length) {
+      await log(
+        db,
+        jobId,
+        'meta_summarize',
+        'warn',
+        `引用方針の自動修正 ${res.violations.length}件`,
+        res.violations.slice(0, 50)
+      );
+    }
+    if (res.lengthWarnings.length) {
+      await log(db, jobId, 'meta_summarize', 'warn', '字数規定外のブロックあり', res.lengthWarnings);
+    }
+    await closeJob(db, jobId, {
+      status: res.status === 'published' ? 'done' : 'failed',
+      ok: res.status === 'published' ? 1 : 0,
+      fail: res.status === 'published' ? 0 : 1,
+      message:
+        res.status === 'published'
+          ? `${res.report_date} のレポートを生成（model=${res.model}）`
+          : `生成せず: ${res.error ?? 'unknown'}（前回のレポートを維持）`,
+      detail: res,
+    });
+    await log(
+      db,
+      jobId,
+      'meta_summarize',
+      res.status === 'published' ? 'info' : 'warn',
+      `要約 ${res.report_date}: ${res.status}`,
+      res.evidence_counts
+    );
+    return c.json(res);
+  } catch (e: any) {
+    const msg = String(e?.message ?? e).slice(0, 300);
+    await closeJob(db, jobId, {
+      status: 'failed',
+      fail: 1,
+      message: `要約に失敗（前回のレポートを維持）: ${msg}`,
+    });
+    await log(db, jobId, 'meta_summarize', 'error', `要約に失敗: ${msg}`);
+    // 前日データが残っている限りフロントは表示を続けられるので 200 系では返さない
+    return c.json({ ok: false, error: msg, kept_previous: true }, 502);
+  }
+});
+
+/**
+ * POST /meta/memory  { limit?: number }
+ * レポート本文と集計を記憶層（meta_knowledge / meta_vectors）へ反映する。
+ */
+admin.post('/meta/memory', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const jobId = await openJob(db, 'memory');
+  try {
+    const report = await loadReport(db, body?.date ? String(body.date) : undefined);
+    let inserted = 0;
+    let skipped = 0;
+    if (report) {
+      const ev = await gatherEvidence(db, { reportDate: report.report_date });
+      const rows = buildKnowledgeRows(report, ev, body?.season ? String(body.season) : null);
+      const up = await upsertKnowledge(db, rows);
+      inserted = up.inserted;
+      skipped = up.skipped;
+    }
+    const emb = await embedKnowledge(c.env, db, { limit: Number(body?.limit) || 64 });
+    const res = { report_date: report?.report_date ?? null, inserted, skipped, ...emb };
+    await closeJob(db, jobId, {
+      status: 'done',
+      ok: 1,
+      newItems: inserted,
+      message: `記憶層更新: 新規${inserted}件 / ベクトル化${emb.embedded}件（残${emb.remaining}）`,
+      detail: res,
+    });
+    await log(db, jobId, 'meta_memory', 'info', '環境情報を記憶層へ反映', res);
+    return c.json({ ok: true, ...res });
+  } catch (e: any) {
+    const msg = String(e?.message ?? e).slice(0, 300);
+    await closeJob(db, jobId, { status: 'failed', fail: 1, message: msg });
+    await log(db, jobId, 'meta_memory', 'error', `記憶層更新に失敗: ${msg}`);
+    return c.json({ ok: false, error: msg }, 502);
+  }
+});
+
+/** GET /meta/status — 管理画面用。公開APIより詳しく、失敗理由まで返す */
+admin.get('/meta/status', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const counts = await metaVectorsReady(db);
+  const today = jstToday();
+
+  const q = async (sql: string, ...binds: unknown[]) => {
+    try {
+      const r = await db.prepare(sql).bind(...(binds as any[])).all();
+      return (r.results ?? []) as any[];
+    } catch {
+      return [];
+    }
+  };
+  const sources = await q(
+    `SELECT key,label,region,kind,method,is_official,trust,enabled,
+            last_status,last_ok_at,last_error,fail_streak,checked_at
+       FROM meta_sources ORDER BY is_official DESC, key ASC`
+  );
+  const jobs = await q(
+    `SELECT id,kind,status,ok_count,fail_count,new_items,message,started_at,finished_at
+       FROM meta_jobs ORDER BY id DESC LIMIT 12`
+  );
+  const reports = await q(
+    `SELECT report_date,status,sources_ok,sources_fail,freshest_at,model,generated_at
+       FROM meta_reports ORDER BY report_date DESC LIMIT 7`
+  );
+  const raw = await q(
+    `SELECT source_key, COUNT(*) AS n, MAX(observed_at) AS newest
+       FROM meta_raw_items GROUP BY source_key ORDER BY n DESC`
+  );
+
+  const collectedToday = sources.filter(
+    (s) => s.last_ok_at && String(s.last_ok_at).slice(0, 10) >= today
+  ).length;
+
+  return c.json({
+    today,
+    counts,
+    collected_today: collectedToday,
+    source_total: sources.filter((s) => Number(s.enabled ?? 1)).length,
+    sources,
+    jobs,
+    reports,
+    raw_by_source: raw,
+  });
 });
 
 export default admin;

@@ -124,6 +124,12 @@ export type SourceRow = {
   is_official: number;
   trust: number;
   enabled: number;
+  // 障害監視用の列（SELECT * で入ってくる。呼び出し側が再収集判定に使う）
+  last_status?: number | null;
+  last_ok_at?: string | null;
+  last_error?: string | null;
+  fail_streak?: number;
+  checked_at?: string | null;
 };
 
 export async function loadSources(db: D1Database, keys?: string[]): Promise<SourceRow[]> {

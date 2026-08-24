@@ -258,11 +258,16 @@
     initLightbox();
     initFavButtons();
     const path = location.pathname;
-    if (path === '/') window.initSearchPage && window.initSearchPage();
+    if (path === '/') {
+      window.initSearchPage && window.initSearchPage();
+      // トップページ左カラムの「最新環境情報」ダイジェスト（検索とは独立に描画）
+      window.initMetaWidget && window.initMetaWidget();
+    }
     else if (path.startsWith('/cards/')) window.initCardDetailPage && window.initCardDetailPage();
     else if (path === '/deck') window.initDeckPage && window.initDeckPage();
     else if (path === '/synergy') window.initSynergyPage && window.initSynergyPage();
     else if (path === '/rules') window.initRulesPage && window.initRulesPage();
+    else if (path === '/meta') window.initMetaPage && window.initMetaPage();
     else if (path === '/favorites') window.initFavoritesPage && window.initFavoritesPage();
     else if (path === '/about') window.initAboutPage && window.initAboutPage();
   });

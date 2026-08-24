@@ -6,6 +6,7 @@ import api from './routes/api';
 import deckApi from './routes/deck';
 import aiApi from './routes/ai';
 import memoryApi from './routes/memory';
+import metaApi from './routes/meta';
 import adminApi from './routes/admin';
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -42,6 +43,7 @@ app.route('/api', api);
 app.route('/api/deck', deckApi);
 app.route('/api/ai', aiApi);
 app.route('/api/memory', memoryApi);
+app.route('/api/meta', metaApi);
 app.route('/api/_ops', adminApi);
 
 // ============================ カード検索（トップ）============================
@@ -49,8 +51,11 @@ app.get('/', (c) =>
   c.render(
     <div class="max-w-7xl mx-auto px-4 py-5">
       <div class="lg:grid lg:grid-cols-[280px_1fr] lg:gap-6">
-        {/* 検索フォーム */}
+        {/* 左カラム: 最新環境情報 + 検索フォーム */}
         <aside class="lg:sticky lg:top-16 lg:self-start lg:max-h-[calc(100vh-5rem)] lg:overflow-y-auto thin-scroll">
+          {/* 毎日1回自動更新される環境レポートのダイジェスト */}
+          <div id="meta-widget" class="mb-3"></div>
+
           <details class="lg:hidden mb-3 bg-slate-900 rounded-lg border border-slate-700" open>
             <summary class="px-4 py-2.5 cursor-pointer font-semibold text-sm">
               <i class="fas fa-sliders mr-2"></i>検索条件
@@ -431,6 +436,74 @@ app.get('/synergy', (c) =>
       </div>
     </div>,
     { title: 'シナジー探索', nav: 'synergy' }
+  )
+);
+
+// ============================ 最新環境情報 ============================
+app.get('/meta', (c) =>
+  c.render(
+    <div class="max-w-6xl mx-auto px-4 py-5">
+      <header class="mb-4">
+        <h1 class="text-lg font-bold">
+          <i class="fas fa-chart-line text-amber-300 mr-1.5"></i>最新環境情報
+        </h1>
+        <p id="meta-updated" class="text-xs text-slate-400 mt-1"></p>
+      </header>
+
+      {/* 明日以降の予定（カウントダウン） */}
+      <section id="meta-countdown" class="mb-5" aria-label="今後の予定"></section>
+
+      <div class="lg:grid lg:grid-cols-2 lg:gap-5">
+        {/* 日本環境ハイライト */}
+        <section id="meta-jp" class="mb-5 lg:mb-0" aria-label="日本環境ハイライト"></section>
+        {/* 海外環境ハイライト */}
+        <section id="meta-en" class="mb-5 lg:mb-0" aria-label="海外環境ハイライト"></section>
+      </div>
+
+      {/* 日本と海外の違い */}
+      <section id="meta-diff" class="my-5" aria-label="日本と海外の違い"></section>
+
+      {/* 注目カード */}
+      <section id="meta-spotlight" class="mb-5" aria-label="注目カード"></section>
+
+      {/* メタシェア表 */}
+      <div class="lg:grid lg:grid-cols-2 lg:gap-5">
+        <section id="meta-snap-jp" class="mb-5 lg:mb-0" aria-label="日本のメタシェア"></section>
+        <section id="meta-snap-en" class="mb-5 lg:mb-0" aria-label="海外のメタシェア"></section>
+      </div>
+
+      {/* 注目デッキレシピ */}
+      <section id="meta-decks" class="my-5" aria-label="注目デッキレシピ"></section>
+
+      {/* 公式リンク集 */}
+      <section id="meta-links" class="my-5" aria-label="公式情報リンク"></section>
+
+      <footer class="mt-6 pt-4 border-t border-slate-700 text-xs text-slate-400 space-y-1.5">
+        <p>
+          <i class="fas fa-circle-info mr-1"></i>
+          本ページは公開情報を自動収集・要約して生成しています。
+          <strong>出典URLを掲示するのは公式情報のみ</strong>です。
+          非公式の情報は要約の材料としてのみ使用し、個別のアカウント名・記事名は記載しません。
+        </p>
+        <p>
+          デッキレシピは出典を明記しています。掲載しているのは
+          <strong>日本語版カードのみで構築できるもの</strong>です。
+        </p>
+        <p>数値・日付は自動処理のため誤りが含まれる場合があります。正確な情報は必ず公式発表をご確認ください。</p>
+      </footer>
+
+      <div id="lightbox" role="dialog" aria-modal="true" aria-label="カード画像拡大">
+        <button
+          id="lightbox-close"
+          class="absolute top-4 right-4 w-10 h-10 rounded-full bg-slate-800/80 text-white grid place-items-center hover:bg-slate-700"
+          aria-label="閉じる"
+        >
+          <i class="fas fa-times"></i>
+        </button>
+        <img id="lightbox-img" src="" alt="" />
+      </div>
+    </div>,
+    { title: '最新環境情報', nav: 'meta' }
   )
 );
 
