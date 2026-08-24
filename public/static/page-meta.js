@@ -268,6 +268,9 @@
 
     set('meta-jp', card(`<div class="text-xs text-slate-400"><i class="fas fa-spinner fa-spin mr-1"></i>読み込み中…</div>`));
 
+    // 帰属表示はレポートの有無に関係なく常時掲出する（規約上必須のため）
+    renderCredits('meta-credits');
+
     let data;
     try {
       data = await apiGet('/api/meta/report');
@@ -345,9 +348,6 @@
 
     // ---- デッキレシピ ----
     renderDecks();
-
-    // ---- 帰属表示（可視クレジット必須のデータ提供元）----
-    renderCredits('meta-credits');
   }
 
   function topicsHtml(topics) {

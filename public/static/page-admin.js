@@ -79,6 +79,7 @@
     $('op-login').classList.add('hidden');
     $('op-panel').classList.remove('hidden');
     refreshStatus();
+    refreshMetaStatus();
   }
 
   // ------------------------------------------------------------ 状態表示
@@ -352,6 +353,176 @@
     }
   }
 
+  // ============================================================ 最新環境情報
+  /**
+   * 日次更新の4段（collect → aggregate → summarize → memory）の手動実行。
+   *
+   * 通常は GitHub Actions（毎日22:00 JST）が同じ順で叩く。ここは検証・復旧用。
+   * collect は Workers のCPU制限を避けるため1回1ソースで返る仕様なので、
+   * done=true / remaining=0 になるまでこちら側でループする。
+   */
+  const META_BTNS = [
+    'op-btn-meta-collect',
+    'op-btn-meta-aggregate',
+    'op-btn-meta-summarize',
+    'op-btn-meta-memory',
+    'op-btn-meta-all',
+  ];
+
+  function metaBtnsDisabled(v) {
+    META_BTNS.forEach((id) => {
+      const b = $(id);
+      if (b) b.disabled = v;
+    });
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  /** ① 収集。全ソースを走り切るまで繰り返す */
+  async function metaCollect() {
+    pushLog('環境情報の収集を開始します', 'info');
+    setProgress(0, '情報を収集中...');
+    let total = 0;
+    let ok = 0;
+    let ng = 0;
+    // ソース数は20前後。取りこぼしを防ぐため上限は余裕を持たせる
+    for (let i = 0; i < 40; i++) {
+      const r = await call('/meta/collect', {});
+      if (r.message && r.remaining === 0 && !r.source) {
+        pushLog(r.message, 'ok');
+        break;
+      }
+      total++;
+      if (r.ok) ok++;
+      else ng++;
+      const skipped = r.detail && r.detail.skipped;
+      const note = skipped
+        ? `スキップ（${skipped}）`
+        : `新規${r.inserted || 0} / 更新${r.updated || 0}`;
+      pushLog(`収集 ${r.label || r.source}: ${note}`, r.ok ? (skipped ? 'warn' : 'ok') : 'error');
+      const done = r.remaining || 0;
+      setProgress(
+        Math.min(95, (total / (total + done || 1)) * 100),
+        `収集中... 完了${total}件 / 残り${done}件`
+      );
+      if (r.done && !r.remaining) break;
+      // 公式サーバへの礼儀。連続で叩かない
+      await sleep(1200);
+    }
+    setProgress(100, `収集完了（成功${ok} / 失敗${ng}）`);
+    pushLog(`収集を終了しました（成功${ok} / 失敗${ng}）`, ng ? 'warn' : 'ok');
+  }
+
+  /** ② 集計（LLM不使用・決定的） */
+  async function metaAggregate() {
+    pushLog('イベント抽出とメタシェア集計を実行します', 'info');
+    const r = await call('/meta/aggregate', {});
+    pushLog(
+      `集計完了: イベント${r.events}件 / 日本${(r.jp && r.jp.rows) || 0}行 / 海外${(r.en && r.en.rows) || 0}行`,
+      'ok'
+    );
+  }
+
+  /** ③ 要約生成。失敗しても既存レポートは維持される */
+  async function metaSummarize() {
+    pushLog('LLMで要約を生成します（1分程度かかることがあります）', 'info');
+    setProgress(50, '要約を生成中...');
+    const r = await call('/meta/summarize', {});
+    if (r.status === 'published') {
+      pushLog(`${r.report_date} のレポートを生成しました（model=${r.model || '-'}）`, 'ok');
+      if (r.violations && r.violations.length) {
+        pushLog(`引用方針の自動修正 ${r.violations.length}件（本文から非公式の固有名を除去）`, 'warn');
+      }
+      if (r.lengthWarnings && r.lengthWarnings.length) {
+        pushLog(`字数規定外のブロック: ${r.lengthWarnings.join(' / ')}`, 'warn');
+      }
+    } else {
+      pushLog(`要約は生成されませんでした（${r.error || 'unknown'}）。前日分の表示を維持します`, 'warn');
+    }
+    setProgress(100, '要約の処理が完了しました');
+  }
+
+  /** ④ 記憶層へ反映（AIのシナジー提案が環境情報を参照できるようになる） */
+  async function metaMemory() {
+    pushLog('環境情報を記憶層（意味ベクトル）へ反映します', 'info');
+    setProgress(60, '記憶層へ反映中...');
+    let guard = 0;
+    let embedded = 0;
+    let inserted = 0;
+    // 残りベクトルが無くなるまで回す（1回あたり64件）
+    while (guard++ < 20) {
+      const r = await call('/meta/memory', { limit: 64 });
+      inserted += r.inserted || 0;
+      embedded += r.embedded || 0;
+      setProgress(80, `記憶層を更新中... 新規${inserted} / ベクトル化${embedded}`);
+      if (!r.remaining) break;
+      await sleep(400);
+    }
+    setProgress(100, '記憶層への反映が完了しました');
+    pushLog(`記憶層を更新: 新規${inserted}件 / ベクトル化${embedded}件`, 'ok');
+  }
+
+  /** ボタン用ラッパ。多重実行を防ぎ、失敗をログに残す */
+  function metaRunner(fn, label) {
+    return async () => {
+      metaBtnsDisabled(true);
+      try {
+        await fn();
+      } catch (e) {
+        pushLog(`${label}に失敗: ${e.message}`, 'error');
+        setProgress(0, `失敗: ${e.message}`);
+      } finally {
+        metaBtnsDisabled(false);
+        refreshMetaStatus();
+        refreshStatus();
+      }
+    };
+  }
+
+  /** ①〜④の連続実行。②以降は前段が失敗しても、可能な範囲で続行する */
+  async function metaRunAll() {
+    await metaCollect();
+    await metaAggregate();
+    try {
+      await metaSummarize();
+    } catch (e) {
+      pushLog(`要約に失敗（前日分を維持）: ${e.message}`, 'warn');
+    }
+    await metaMemory();
+    pushLog('日次更新の一連の処理が完了しました', 'ok');
+  }
+
+  /** 収集状況の表示 */
+  async function refreshMetaStatus() {
+    const host = $('op-meta-status');
+    if (!host) return;
+    let s;
+    try {
+      s = await call('/meta/status');
+    } catch (_) {
+      host.innerHTML = '';
+      return;
+    }
+    const rep = (s.reports || [])[0];
+    const failing = (s.sources || []).filter((x) => Number(x.fail_streak || 0) > 0);
+    const c = s.counts || {};
+    host.innerHTML =
+      `<div class="flex flex-wrap gap-x-4 gap-y-1">` +
+      `<span>本日の収集: <b class="text-slate-100">${s.collected_today || 0}</b> / ${s.source_total || 0} ソース</span>` +
+      `<span>最新レポート: <b class="text-slate-100">${rep ? esc(rep.report_date) : '未生成'}</b>` +
+      (rep && rep.status !== 'published' ? `<span class="text-amber-300 ml-1">(${esc(rep.status)})</span>` : '') +
+      `</span>` +
+      `<span>環境情報の記憶: <b class="text-slate-100">${c.knowledge ?? 0}</b> 件（ベクトル ${c.vectors ?? 0}）</span>` +
+      `</div>` +
+      (failing.length
+        ? `<div class="mt-1 text-amber-300">連続失敗中: ` +
+          failing
+            .map((x) => `${esc(x.label || x.key)}(${x.fail_streak}回)`)
+            .join('、') +
+          `</div>`
+        : '');
+  }
+
   // ------------------------------------------------------------ 初期化
   document.addEventListener('DOMContentLoaded', async () => {
     $('op-login-form')?.addEventListener('submit', login);
@@ -365,7 +536,17 @@
     $('op-btn-rules')?.addEventListener('click', checkRules);
     $('op-btn-faqs')?.addEventListener('click', updateFaqs);
     $('op-btn-memory')?.addEventListener('click', rebuildMemory);
-    $('op-btn-refresh')?.addEventListener('click', refreshStatus);
+    $('op-btn-refresh')?.addEventListener('click', () => {
+      refreshStatus();
+      refreshMetaStatus();
+    });
+
+    // 最新環境情報（日次更新）の4段
+    $('op-btn-meta-collect')?.addEventListener('click', metaRunner(metaCollect, '収集'));
+    $('op-btn-meta-aggregate')?.addEventListener('click', metaRunner(metaAggregate, '集計'));
+    $('op-btn-meta-summarize')?.addEventListener('click', metaRunner(metaSummarize, '要約生成'));
+    $('op-btn-meta-memory')?.addEventListener('click', metaRunner(metaMemory, '記憶層への反映'));
+    $('op-btn-meta-all')?.addEventListener('click', metaRunner(metaRunAll, '日次更新'));
 
     // 既にセッションがあればパネルを出す
     try {

@@ -783,6 +783,44 @@ const ADMIN_HTML = `<!DOCTYPE html>
       </div>
     </div>
 
+    {/*
+      最新環境情報の手動実行。
+      通常は GitHub Actions が毎日22:00（JST）に collect→aggregate→summarize→memory を回すが、
+      検証時・障害復旧時に同じ4段を手で叩けるようにしておく。
+      collect は Workers のCPU制限を避けるため「1回1ソース」で返るので、ここで完了までループする。
+    */}
+    <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4 space-y-3">
+      <h2 class="text-sm font-semibold text-slate-300">
+        <i class="fas fa-chart-line text-amber-300 mr-1"></i>最新環境情報（日次更新）
+      </h2>
+
+      <div class="flex flex-wrap items-center gap-2">
+        <button id="op-btn-meta-collect" class="bg-sky-700 hover:bg-sky-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
+          <i class="fas fa-satellite-dish mr-1"></i>① 情報を収集
+        </button>
+        <button id="op-btn-meta-aggregate" class="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
+          <i class="fas fa-calculator mr-1"></i>② 集計
+        </button>
+        <button id="op-btn-meta-summarize" class="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
+          <i class="fas fa-pen-nib mr-1"></i>③ 要約を生成
+        </button>
+        <button id="op-btn-meta-memory" class="bg-indigo-700 hover:bg-indigo-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
+          <i class="fas fa-brain mr-1"></i>④ 記憶層へ反映
+        </button>
+        <button id="op-btn-meta-all" class="bg-amber-700 hover:bg-amber-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm font-medium transition">
+          <i class="fas fa-forward-fast mr-1"></i>①〜④を続けて実行
+        </button>
+      </div>
+
+      <div id="op-meta-status" class="text-xs text-slate-300"></div>
+
+      <p class="text-[11px] text-slate-500 leading-relaxed">
+        ①は1回のリクエストで1ソースずつ進みます（公式サーバへの礼儀のため間隔を空けます）。完了まで自動で繰り返します。<br />
+        ③が失敗した場合、既存のレポートは書き換えず<strong class="text-slate-400">前日分の表示を維持</strong>します。<br />
+        X（旧Twitter）と TopDeck.gg はAPIキーが必要です。未設定のソースは「スキップ」として成功扱いになります。
+      </p>
+    </div>
+
     <!-- 実行ログ -->
     <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
       <h2 class="text-sm font-semibold text-slate-300 mb-2">実行ログ</h2>
