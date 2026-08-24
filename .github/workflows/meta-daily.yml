@@ -1,0 +1,105 @@
+name: 最新環境情報の日次更新
+
+# 仕様§6: メイン更新は毎日 22:00 JST。
+# Workers には1リクエストあたりのCPU/実行時間の上限があるため、
+# collect（1ソース/回）→ aggregate → summarize → memory の順に
+# 外部から呼び出して分割実行する。
+on:
+  schedule:
+    # GitHub Actions の cron は UTC。22:00 JST = 13:00 UTC
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+    inputs:
+      skip_summarize:
+        description: '要約をスキップ（収集のみ）'
+        type: boolean
+        default: false
+
+concurrency:
+  group: meta-daily
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 管理セッションを取得
+        env:
+          BASE: ${{ secrets.SITE_BASE_URL }}
+          PW: ${{ secrets.ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE:-}" ] || [ -z "${PW:-}" ]; then
+            echo "::error::SITE_BASE_URL / ADMIN_PASSWORD シークレットが未設定です"
+            exit 1
+          fi
+          code=$(curl -sS -o /tmp/login.json -w '%{http_code}' \
+            -c /tmp/cookie.txt -X POST "$BASE/api/_ops/login" \
+            -H 'content-type: application/json' \
+            -d "$(jq -nc --arg p "$PW" '{password:$p}')")
+          if [ "$code" != "200" ]; then
+            echo "::error::ログイン失敗 HTTP $code"; cat /tmp/login.json; exit 1
+          fi
+          echo "ログイン成功"
+
+      - name: 収集（done になるまで1ソースずつ）
+        env:
+          BASE: ${{ secrets.SITE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          # 上限を設けて無限ループを避ける。ソース数より十分大きい値
+          for i in $(seq 1 40); do
+            out=$(curl -sS -b /tmp/cookie.txt -X POST "$BASE/api/_ops/meta/collect" \
+              -H 'content-type: application/json' -d '{}')
+            echo "[$i] $out"
+            if [ "$(echo "$out" | jq -r '.done // false')" = "true" ] \
+               && [ "$(echo "$out" | jq -r '.remaining // 0')" = "0" ]; then
+              echo "収集完了"; break
+            fi
+            # 相手サイトへの負荷を避けるため各ソース間で待つ
+            sleep 5
+          done
+
+      - name: 集計（イベント抽出＋メタシェア計算）
+        env:
+          BASE: ${{ secrets.SITE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          curl -sS -b /tmp/cookie.txt -X POST "$BASE/api/_ops/meta/aggregate" \
+            -H 'content-type: application/json' -d '{}' | tee /tmp/agg.json
+          echo
+
+      - name: 要約（LLM）
+        if: ${{ inputs.skip_summarize != true }}
+        env:
+          BASE: ${{ secrets.SITE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          # 失敗しても前日分のレポートは保持される（サーバ側で kept_previous=true を返す）
+          code=$(curl -sS -o /tmp/sum.json -w '%{http_code}' \
+            -b /tmp/cookie.txt -X POST "$BASE/api/_ops/meta/summarize" \
+            -H 'content-type: application/json' -d '{}')
+          cat /tmp/sum.json; echo
+          if [ "$code" != "200" ]; then
+            echo "::warning::要約に失敗しました（HTTP $code）。前日のレポートを継続表示します"
+          fi
+
+      - name: 記憶層へ反映
+        if: ${{ inputs.skip_summarize != true }}
+        env:
+          BASE: ${{ secrets.SITE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          curl -sS -b /tmp/cookie.txt -X POST "$BASE/api/_ops/meta/memory" \
+            -H 'content-type: application/json' -d '{}' | tee /tmp/mem.json
+          echo
+
+      - name: 状態サマリ
+        if: always()
+        env:
+          BASE: ${{ secrets.SITE_BASE_URL }}
+        run: |
+          curl -sS -b /tmp/cookie.txt "$BASE/api/_ops/meta/status" \
+            | jq '{reports, sources_fail: [.sources[] | select(.fail_streak > 0) | {key, fail_streak, last_error}]}' \
+            || echo "状態取得に失敗"
