@@ -610,13 +610,26 @@ export type CardIndex = {
   byEn: Map<string, { id: number; name: string }>;
   /** 日本語 card_group（「アリエル／麗しい歌姫」）キー → cards.id */
   byJa: Map<string, { id: number; name: string }>;
+  /**
+   * 「カード名 + インクコスト」キー → cards.id
+   *
+   * なぜ必要か（実測）: 画像から同定させるとモデルは副題を落とした短い名前
+   * （「ディアブロ」「アースラ」）を返すが、ロルカナには同名で副題の違う
+   * 別カードが最大11種類ある。名前だけで引くと別カードを同一視して
+   * 枚数を合算し、「ディアブロ12枚」という実在しないデッキを作ってしまった。
+   * カード左上のコストを併せて読めば、ほぼ一意に版を決められる。
+   */
+  byNameCost: Map<string, { id: number; name: string }>;
 };
 
 /** カード突合用のインデックスを作る（2,500件で約数十ms） */
 export async function buildCardIndex(db: D1Database): Promise<CardIndex> {
-  const r = await db.prepare('SELECT id, card_file, card_name, version, card_group FROM cards').all();
+  const r = await db
+    .prepare('SELECT id, card_file, card_name, version, card_group, ink_cost FROM cards')
+    .all();
   const byEn = new Map<string, { id: number; name: string }>();
   const byJa = new Map<string, { id: number; name: string }>();
+  const byNameCost = new Map<string, { id: number; name: string }>();
   for (const row of (r.results ?? []) as any[]) {
     const id = Number(row.id);
     const jaName = row.version ? `${row.card_name} – ${row.version}` : String(row.card_name);
@@ -630,8 +643,31 @@ export async function buildCardIndex(db: D1Database): Promise<CardIndex> {
     }
     const plain = joinKey(`${row.card_name}${row.version ?? ''}`);
     if (plain && !byJa.has(plain)) byJa.set(plain, { id, name: jaName });
+    /*
+     * カード名だけのキーも登録する。
+     *
+     * なぜ必要か（実測）: 画像からカードを同定させると、モデルは副題を
+     * 落とした短い名前（「ディアブロ」「アースラ」「マックス・グーフ」）を返す。
+     * 上の plain は card_name+version の連結キーなので、副題を持つカードは
+     * 短い名前で引けず、DBに実在するのに未特定になって60枚の読み取りが
+     * 丸ごと却下されていた。
+     *
+     * 副題違いの同名カードが複数ある場合は、最初の1件だけを保持する
+     * （既存キーを上書きしない）。どの副題かは画像だけでは決まらないことがあるが、
+     * デッキ表の突合では同名カードはカード名で識別されるため実害がない。
+     */
+    const nameOnly = joinKey(String(row.card_name ?? ''));
+    if (nameOnly && nameOnly !== plain && !byJa.has(nameOnly)) {
+      byJa.set(nameOnly, { id, name: jaName });
+    }
+    // 「名前+コスト」キー。同名でもコストが違えば別カードとして引ける
+    const cost = Number(row.ink_cost);
+    if (nameOnly && Number.isFinite(cost)) {
+      const ck = `${nameOnly}#${cost}`;
+      if (!byNameCost.has(ck)) byNameCost.set(ck, { id, name: jaName });
+    }
   }
-  return { byEn, byJa };
+  return { byEn, byJa, byNameCost };
 }
 
 /**
@@ -1093,8 +1129,19 @@ function editDistance(a: string, b: string, max: number): number {
  */
 export function matchOcrCardName(
   raw: string,
-  index: CardIndex
+  index: CardIndex,
+  cost?: number | null
 ): { id: number; name: string; fuzzy: boolean } | null {
+  /*
+   * コストが読めているなら「名前+コスト」で先に引く。
+   * 同名別カード（「ディアブロ」7種、「アースラ」11種）を取り違えないため、
+   * 名前だけの照合よりこちらを優先する。
+   */
+  if (Number.isInteger(cost as number)) {
+    const nk = joinKey(String(raw ?? '').replace(/[–—-]/g, ''));
+    const hit = index.byNameCost.get(`${nk}#${cost}`);
+    if (hit) return { ...hit, fuzzy: false };
+  }
   const exact = matchJpDeckCardName(raw, index);
   if (exact) return { ...exact, fuzzy: false };
 
@@ -1546,23 +1593,75 @@ export async function collectSocialDecks(
 }
 
 /**
+ * 画像URLを「文字が読める解像度」に昇格させる。
+ *
+ * ホストごとに効くパラメータが違うので、ここで一元化する。
+ *   ・note (assets.st-note.com): `width=` だけが効く（rect=/crop=/w= は無視される）。
+ *     実測で width=1200 は19枚中0枚しか読めず、width=2000 で 19/19 読めた。
+ *     原寸4096pxは Vision 側のダウンロードがタイムアウトする（HTTP 400）。
+ *   ・X (pbs.twimg.com): 既定の `name=medium` は長辺680pxで、カード右上の
+ *     枚数バッジ「xN」が潰れて読めないことがある。`name=orig`（原寸）に上げる。
+ *     X は 4096x4096 までしか保持しないので name=orig が実質の上限。
+ */
+export function upgradeImageUrl(url: string): string {
+  const u = String(url).trim();
+  if (!u) return u;
+  if (/pbs\.twimg\.com/i.test(u)) {
+    // name= を orig に差し替える。無ければ付ける。format= はそのまま残す
+    const base = u.replace(/[?&]name=[^&]*/gi, '');
+    return `${base}${base.includes('?') ? '&' : '?'}name=orig`;
+  }
+  if (/assets\.st-note\.com/i.test(u)) {
+    const base = u.replace(/\?.*$/, '');
+    return `${base}?width=2000`;
+  }
+  return u;
+}
+
+/**
+ * 画像の前後の本文から「デッキレシピ画像らしさ」を採点する。
+ *
+ * なぜ必要か（実測）: note の記事は1本に10枚以上の画像を貼っていて、
+ * その大半が買取価格表・カード1〜3枚の解説・メタ円グラフ・アプリのスクショだった
+ * （目視した6枚のうちデッキ表は1枚だけ）。Vision は1枚あたり十数秒かかるので、
+ * 貼られた順に総当たりすると本命に届く前に上限へ達する。
+ * 画像の直前直後のテキストで並べ替えれば、本命を先に読める。
+ */
+export function scoreImageContext(text: string): number {
+  const t = String(text);
+  let s = 0;
+  // レシピそのものを指す語
+  for (const w of ['デッキリスト', 'デッキレシピ', 'レシピ', 'デッキ構築', '構築', '採用カード', 'デッキ内容']) {
+    if (t.includes(w)) s += 3;
+  }
+  // 大会・順位の文脈（入賞デッキの掲載は本命率が高い）
+  for (const w of ['優勝', '準優勝', 'ベスト4', '入賞', '選手', '使用デッキ']) {
+    if (t.includes(w)) s += 2;
+  }
+  // 明確に別物を指す語は減点
+  for (const w of ['買取', '価格', '相場', 'シングル', '販売', 'メタ分布', '使用率', 'プレゼント', '抽選', '発売日']) {
+    if (t.includes(w)) s -= 4;
+  }
+  return s;
+}
+
+/**
  * 記事HTMLから「デッキ表の候補になる画像」URLを取り出す。
  *
  * note の本文画像は assets.st-note.com/img/... に置かれている。
- * 実測: 取得する際に `?width=2000` を付けないと帯のカード名が小さすぎて読めない。
- * （width=1200 では 19枚中0枚、width=2000 で 19/19 読めた。原寸 4096px は
- *   取得が遅すぎて Vision 側のダウンロードがタイムアウトする。）
+ * 解像度の昇格は upgradeImageUrl に集約した。
  *
  * プロフィール画像や見出し画像はデッキ表でないので除く。
+ * 返す順は「本文の文脈で採点した降順」で、貼られた順ではない（上記の理由）。
  */
 export function extractArticleImages(html: string, opts: { limit?: number } = {}): string[] {
   const limit = Math.max(1, Math.min(12, opts.limit ?? 8));
-  const out: string[] = [];
   const seen = new Set<string>();
+  const cand: Array<{ url: string; score: number; at: number }> = [];
   const re = /https?:\\?\/\\?\/assets\.st-note\.com\/(?:img|production)\/[A-Za-z0-9._\\/-]+\.(?:png|jpe?g|webp)/gi;
   for (const m of html.matchAll(re)) {
-    // JSON 埋め込みでエスケープされた \\u002F / \\/ を戻す
-    const clean = m[0].replace(/\\u002F/gi, '/').replace(/\\\\\//g, '/');
+    // JSON 埋め込みでエスケープされた \u002F / \/ を戻す
+    const clean = m[0].replace(/\\u002F/gi, '/').replace(/\\\//g, '/');
     /*
      * プロフィール・アイコンに加えて、note の見出し画像（アイキャッチ）も除く。
      * アイキャッチは production/uploads/images/.../rectangle_large_type_2_*
@@ -1573,11 +1672,17 @@ export function extractArticleImages(html: string, opts: { limit?: number } = {}
     const key = clean.replace(/\?.*$/, '');
     if (seen.has(key)) continue;
     seen.add(key);
-    // 帯の文字が読める幅で取る（上記の実測による）
-    out.push(`${key}?width=2000`);
-    if (out.length >= limit) break;
+    /*
+     * 画像の出現位置の前後だけを見る。前を広く（見出しは画像の上にある）、
+     * 後ろを狭く取る。タグを落として素のテキストで判定する。
+     */
+    const at = m.index ?? 0;
+    const around = html.slice(Math.max(0, at - 1200), at + 400).replace(/<[^>]*>/g, ' ');
+    cand.push({ url: upgradeImageUrl(key), score: scoreImageContext(around), at });
   }
-  return out;
+  // 得点の高い順。同点なら記事の登場順（レシピは前半に貼られることが多い）
+  cand.sort((a, b) => b.score - a.score || a.at - b.at);
+  return cand.slice(0, limit).map((c) => c.url);
 }
 
 /** 共有コード群を1デッキとして meta_decks / meta_deck_cards に書き込む */
@@ -2468,7 +2573,12 @@ export async function collectXUser(
     const key = String(m?.media_key ?? '');
     if (!key || m?.type !== 'photo') continue;
     const url = String(m?.url ?? m?.preview_image_url ?? '');
-    if (url) mediaMap.set(key, url);
+    /*
+     * X が返す media.url は既定で name=medium（長辺680px）。
+     * デッキ画像ではカード右上の枚数バッジ「xN」が潰れて読めないため、
+     * 保存時点で name=orig（原寸）へ上げておく。
+     */
+    if (url) mediaMap.set(key, upgradeImageUrl(url));
   }
 
   const posts: XPost[] = (t.json?.data ?? []) as XPost[];

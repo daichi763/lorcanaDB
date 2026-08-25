@@ -580,6 +580,47 @@ console.log('\n[9] ソース定義の整合性');
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
     });
     ok(noAuth2.status === 401 || noAuth2.status === 403, '画像収集は認証が必要');
+
+    /*
+     * 別AIとの比較で分かった3点。文字を読む(OCR)のではなく
+     * 絵柄からカードを同定させ、解像度を上げ、本文で候補を絞る。
+     */
+    ok(/イラストに描かれているキャラクター/.test(dk),
+       '帯の文字だけでなく絵柄からカードを同定させる');
+    ok(/readRowQty/.test(dk), '枚数バッジは名前と分けて読む');
+    ok(/qtyFix\.length === r\.cards\.length/.test(dk),
+       '枚数の補完は枠数が一致するときだけ使う（位置ずれで嘘にならないように）');
+    ok(/export function upgradeImageUrl/.test(mt), '画像URLを読める解像度に昇格させる関数がある');
+    ok(/name=orig/.test(mt), 'X の画像は name=orig（原寸）で取る');
+    ok(/upgradeImageUrl\(url\)/.test(mt), 'X の収集時点で解像度を上げて保存する');
+    ok(/export function scoreImageContext/.test(mt), '本文の文脈でレシピ画像を絞り込む関数がある');
+    ok(/scoreImageContext\(around\)/.test(mt), '画像の前後の本文で候補を並べ替える');
+
+    /*
+     * 同名別カードの取り違え対策。ロルカナは「ディアブロ」7種・「アースラ」11種など
+     * 副題違いの同名カードがあり、名前だけで突合すると枚数が合算されて
+     * 「ディアブロ12枚」という実在しないデッキになった（実測）。
+     */
+    ok(/byNameCost/.test(mt), 'カード名+コストで同名別カードを区別する索引がある');
+    ok(/matchOcrCardName\(c\.raw, index, c\.cost\)/.test(dk), '突合にコストを渡す');
+    ok(/over_4_copies/.test(dk), '1種5枚以上になった読み取りは採らない');
+    ok(/c\.qty > 4/.test(dk), '4枚を超えた種類を検出する');
+    ok(/必ず cost に入れる/.test(dk), 'コストを読ませるよう指示している');
+
+    // 解像度の昇格が実際に効いているか（ホスト別に効くパラメータが違う）
+    const { upgradeImageUrl, scoreImageContext } = await import('../src/lib/meta.ts')
+      .catch(() => ({}));
+    if (upgradeImageUrl) {
+      ok(upgradeImageUrl('https://pbs.twimg.com/media/AAA.jpg?name=medium')
+           .includes('name=orig'),
+         'X の name=medium を orig に差し替える');
+      ok(upgradeImageUrl('https://assets.st-note.com/img/1-a.jpg?width=640')
+           === 'https://assets.st-note.com/img/1-a.jpg?width=2000',
+         'note の width は 2000 に揃える');
+      ok(scoreImageContext('優勝デッキのデッキリストです')
+           > scoreImageContext('シングル買取価格表'),
+         'レシピ本文は買取価格表より高く採点される');
+    }
   }
 
 }

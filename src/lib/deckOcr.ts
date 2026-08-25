@@ -42,7 +42,8 @@ import { buildCardIndex, matchOcrCardName, politeFetch, politeSleep, sha256Hex,
 /** 画像1段の読み取り結果 */
 export type OcrDeckRow = {
   exists: boolean;
-  cards: Array<{ name: string | null; qty: number | null }>;
+  /** cost はインクコスト（カード左上の数字）。同名別カードの区別に使う */
+  cards: Array<{ name: string | null; qty: number | null; cost: number | null }>;
 };
 
 /**
@@ -67,7 +68,7 @@ export type OcrDeckImage = {
   image_url: string;
   kind: 'deck' | 'other';
   rows: number;
-  cards: Array<{ raw: string; qty: number }>;
+  cards: Array<{ raw: string; qty: number; cost: number | null }>;
   total: number;
   /** レイアウト把握で数えた枠の総数（採否判定の検証に使う） */
   slots: number;
@@ -183,11 +184,12 @@ async function readDeckRow(
   opts: { model?: string; timeoutMs?: number; expectSlots?: number; totalRows?: number } = {}
 ): Promise<OcrDeckRow> {
   const instruction = [
-    'ディズニーロルカナ（日本語版）のデッキ画像を読み取る作業です。',
+    'ディズニーロルカナ（日本語版）のデッキ画像から、並んでいるカードを同定する作業です。',
+    '文字を読み取る作業ではなく、カードを見て「どのカードか」を当てる作業です。',
     '',
     '【画像の形式】',
     'カード画像が格子状に並び、各カードの右上に丸いバッジ「x1」〜「x4」で枚数が書かれている。',
-    'カード名はカードのイラストの下の帯に書かれている。',
+    'カード名はイラストの下の帯に書かれているが、縮小されて潰れていることがある。',
     '',
     opts.totalRows
       ? `【画像の並び】この画像は全${opts.totalRows}段。今回読むのは上から${row}段目の横一列だけ。他の段は読まない。`
@@ -195,14 +197,26 @@ async function readDeckRow(
     // 枠数を先に伝えると読み落とし（合計52枚になる事故）を防げる
     opts.expectSlots ? `この段には${opts.expectSlots}枠ある。${opts.expectSlots}件すべて出力する。` : '',
     '',
-    '【各カードについて】',
-    '  ・枚数: 右上のバッジ「xN」。バッジは文字が大きいので確実に読める。',
-    '  ・カード名: 帯の文字。ただし【カード名一覧】に載っている名前の中から選ぶ。',
-    '    一覧に無い名前を創作してはいけない。',
-    '    読めた文字に最も近い一覧の名前を選ぶ。どれとも判断できない枠は name を null にする。',
+    '【カードの同定のしかた】',
+    '帯の文字だけに頼らない。次の3つを合わせて判断する。',
+    '  1. イラストに描かれているキャラクターは誰か（ディズニー作品のキャラクター）。',
+    '  2. カードの絵柄・構図・枠の色（インク色）はどうか。',
+    '  3. 帯の文字のうち読み取れる部分。',
+    'そのうえで【カード名一覧】から最も当てはまる名前を1つ選ぶ。',
+    '一覧に無い名前を創作してはいけない。',
+    'キャラクターは分かるが一覧のどの名前か絞れない場合も、絵柄が最も近いものを選ぶ。',
+    'キャラクターすら判別できない枠だけ name を null にする。',
     '  ・枠は飛ばさず、左から右へ順に全部出す。',
     '',
-    `【出力】JSONのみ。{"row":${row},"exists":true,"cards":[{"name":"カード名またはnull","qty":4}]}`,
+    '【コストも必ず読む】',
+    'カード左上の丸い枠の中の数字が「インクコスト」。',
+    'ロルカナには同じ名前で副題（サブタイトル）が違う別カードが何種類もあり',
+    '（例:「ディアブロ」は7種類、「アースラ」は11種類）、名前だけでは区別できない。',
+    'コストが分かれば別カードとして正しく扱えるので、必ず cost に入れる。',
+    '読めない場合だけ null にする。',
+    '',
+    `【出力】JSONのみ。{"row":${row},"exists":true,"cards":[{"name":"カード名またはnull","qty":4,"cost":3}]}`,
+    'qty は右上のバッジ「xN」の数字。読めない場合は null にする。',
     `${row}段目が存在しない（カードが並んでいない）場合は exists:false, cards:[] とする。`,
     '',
     '【カード名一覧】',
@@ -216,11 +230,59 @@ async function readDeckRow(
   const cards = Array.isArray(parsed?.cards) ? parsed.cards : [];
   return {
     exists: parsed?.exists !== false && cards.length > 0,
-    cards: cards.slice(0, 14).map((c: any) => ({
-      name: c?.name ? String(c.name).trim() : null,
-      qty: Number.isFinite(Number(c?.qty)) ? Number(c.qty) : null,
-    })),
+    cards: cards.slice(0, 14).map((c: any) => {
+      const cost = Number(c?.cost);
+      return {
+        name: c?.name ? String(c.name).trim() : null,
+        qty: Number.isFinite(Number(c?.qty)) ? Number(c.qty) : null,
+        // ロルカナのコストは1〜10の範囲。外れた値は読み違いなので採らない
+        cost: Number.isInteger(cost) && cost >= 1 && cost <= 10 ? cost : null,
+      };
+    }),
   };
+}
+
+/**
+ * 1段の「枚数バッジ」だけを読む。カード名は読ませない。
+ *
+ * なぜ名前と分けるか（実測）: 名前の同定は1,162件の語彙から選ぶ重い作業で、
+ * そこに枚数まで載せると枚数側が犠牲になり、合計が54〜55枚に沈んだ。
+ * 枚数バッジは文字が大きく、語彙も不要な単純作業なので、
+ * 分けて聞けば安く確実に埋まる。名前が分かっていても枚数が欠けると
+ * 60枚に届かず採用できないため、この1回は費用対効果が高い。
+ */
+async function readRowQty(
+  env: AiEnv,
+  imageUrl: string,
+  row: number,
+  opts: { model?: string; expectSlots?: number; totalRows?: number } = {}
+): Promise<Array<number | null>> {
+  const instruction = [
+    'ディズニーロルカナのデッキ画像から、枚数のバッジだけを読む作業です。',
+    'カード名は読まなくてよい。枚数だけを見る。',
+    '',
+    '【枚数バッジ】各カードの右上に付いている丸いバッジで「x1」「x2」「x3」「x4」と書かれている。',
+    'バッジが付いていない枠は1枚を意味するので 1 とする。',
+    '',
+    opts.totalRows
+      ? `この画像は全${opts.totalRows}段。今回読むのは上から${row}段目の横一列だけ。`
+      : `画像の上から${row}段目の横一列だけを読む。`,
+    opts.expectSlots ? `この段には${opts.expectSlots}枠ある。左から順に${opts.expectSlots}件の数字を出す。` : '',
+    '',
+    '【出力】JSONのみ。左から右の順に数字を並べる。',
+    '{"qty":[4,4,2,1]}',
+    'どうしても読めない枠だけ null を入れる。',
+  ].filter(Boolean).join('\n');
+
+  const parsed = await visionJson(env, imageUrl, instruction, {
+    model: opts.model, maxTokens: 1_200,
+  });
+  if (!parsed) return [];
+  const arr = Array.isArray(parsed?.qty) ? parsed.qty : [];
+  return arr.slice(0, 14).map((n: unknown) => {
+    const v = Number(n);
+    return Number.isInteger(v) && v >= 1 && v <= 4 ? v : null;
+  });
 }
 
 /**
@@ -262,12 +324,52 @@ export async function readDeckImage(
      */
     if (r.cards.length > expect + 1) continue;
     out.rows = row;
-    for (const c of r.cards) {
+
+    /*
+     * 名前の同定で枚数が欠けた（null）枠があれば、枚数だけを読む専用パスで補う。
+     * 名前と枚数を1回で聞くと枚数側が犠牲になり合計54〜55枚に沈んだため
+     * （実測）。欠けが無い段では追加の呼び出しをしない。
+     */
+    let qtyFix: Array<number | null> = [];
+    if (r.cards.some((c) => !c.qty)) {
+      qtyFix = await readRowQty(env, imageUrl, row, {
+        model: opts.model, expectSlots: expect, totalRows: rows.length,
+      });
+    }
+
+    /*
+     * 同じ段をもう一度読み、2回で一致した枠だけを採る。
+     *
+     * なぜ必要か（実測）: 合計60枚・4枚上限という数の条件を満たしても、
+     * 中身が別カードに化けることがあった。ケン選手の画像18枠のうち3枠が
+     * 「背すじがゾクッ！→よみがえる王冠」「パラダイスの滝→神秘の木」など
+     * 実際とは違うカードになっていた。数の検査では検出できない誤りなので、
+     * 独立した2回の読み取りで一致を要求する。
+     * 一致しない枠は落とすので合計が60枚を割り、そのデッキは採用されない。
+     * 誤ったデッキを載せるより、載せないほうがよい。
+     */
+    const r2 = await readDeckRow(env, imageUrl, row, vocab, {
+      model: opts.model, expectSlots: expect, totalRows: rows.length,
+    });
+    const agree = r2.cards.length === r.cards.length ? r2.cards : null;
+
+    for (let j = 0; j < r.cards.length; j++) {
+      const c = r.cards[j];
       out.readSlots++;
-      // 枚数が読めない枠は採らない。推測で埋めると枚数が嘘になる
-      if (!c.name || !c.qty || c.qty < 1 || c.qty > 4) continue;
-      out.cards.push({ raw: c.name, qty: c.qty });
-      out.total += c.qty;
+      // 枚数専用パスの結果は、枠数が一致しているときだけ採用する（位置がずれると嘘になる）
+      const qty = c.qty ?? (qtyFix.length === r.cards.length ? qtyFix[j] : null);
+      // 名前も枚数も、読めない枠は採らない。推測で埋めると内容が嘘になる
+      if (!c.name || !qty || qty < 1 || qty > 4) continue;
+      /*
+       * 2回目の読み取りと名前が食い違う枠は捨てる（上記の理由）。
+       * コストは片方だけ読めていることがあるので、名前の一致だけを条件にする。
+       */
+      if (agree) {
+        const other = agree[j];
+        if (!other?.name || other.name !== c.name) continue;
+      }
+      out.cards.push({ raw: c.name, qty, cost: c.cost });
+      out.total += qty;
     }
   }
   if (out.cards.length >= 8) out.kind = 'deck';
@@ -284,7 +386,7 @@ export function resolveOcrDeck(
   index: CardIndex
 ): {
   ok: boolean;
-  reason?: 'not_deck' | 'missed_slots' | 'under_60' | 'low_match';
+  reason?: 'not_deck' | 'missed_slots' | 'under_60' | 'low_match' | 'over_4_copies';
   total: number;
   fuzzy: number;
   cards: Array<{ card_id: number | null; card_name: string; raw: string; qty: number }>;
@@ -293,11 +395,17 @@ export function resolveOcrDeck(
   const cards: Array<{ card_id: number | null; card_name: string; raw: string; qty: number }> = [];
   const missing: string[] = [];
   let fuzzy = 0;
-  // 同じカードが複数枠に出た場合（別レアリティ掲載など）は枚数を足す
+  /*
+   * 同じカードが複数枠に出た場合（別レアリティ掲載など）は枚数を足す。
+   * ただし足した結果5枚以上になったものは、下の over_4_copies で弾く
+   * （合算は誤同定を隠してしまうため、必ず後段で検査する）。
+   */
   const byId = new Map<string, { card_id: number | null; card_name: string; raw: string; qty: number }>();
   for (const c of img.cards) {
-    const hit = matchOcrCardName(c.raw, index);
-    const key = hit ? `id:${hit.id}` : `raw:${c.raw}`;
+    // コストを渡して同名別カードを区別する（名前だけだと合算されてしまう）
+    const hit = matchOcrCardName(c.raw, index, c.cost);
+    // 突合できなかった枠もコストで区別する（同名別カードを混ぜないため）
+    const key = hit ? `id:${hit.id}` : `raw:${c.raw}#${c.cost ?? '?'}`;
     const cur = byId.get(key);
     if (cur) {
       cur.qty += c.qty;
@@ -325,6 +433,18 @@ export function resolveOcrDeck(
   }
   // ロルカナのルールで60枚は下限。下回るのは読み落とし
   if (total < 60) return { ok: false, reason: 'under_60', total, fuzzy, cards, missing };
+  /*
+   * ロルカナは同名カードを1デッキに4枚までしか入れられない。
+   * 5枚以上になったものは、別のカードを同じ名前に取り違えて
+   * 枚数が合算された結果である（実測: 同定の誤りで「ディアブロ12枚」
+   * 「アースラ8枚」という不可能なデッキが合計60枚で通ってしまった）。
+   * 合計が60枚でも、内容が破綻しているので採用しない。
+   */
+  const over = cards.filter((c) => c.qty > 4);
+  if (over.length) {
+    return { ok: false, reason: 'over_4_copies', total, fuzzy, cards,
+             missing: over.map((c) => `${c.card_name}×${c.qty}`) };
+  }
   const matched = cards.filter((c) => c.card_id).length;
   // 突合率が低い＝OCRを信用できない。中身の怪しいデッキを出さない
   if (matched / cards.length < 0.9) return { ok: false, reason: 'low_match', total, fuzzy, cards, missing };
@@ -536,7 +656,12 @@ export async function collectImageDecks(
          * ただし missed_slots（読み落とし）は画像側の問題ではなく読み取りの失敗なので
          * 記録せず、次回また挑戦できるようにする。
          */
-        if (res.reason !== 'missed_slots') {
+        /*
+         * missed_slots と over_4_copies は画像側の問題ではなく
+         * 読み取り・同定の失敗なので、読み済みとして記録しない
+         * （プロンプトを直せば同じ画像で成功しうる）。
+         */
+        if (res.reason !== 'missed_slots' && res.reason !== 'over_4_copies') {
           await markImageOcr(db, imageUrl, it.url, img.kind === 'deck' ? 'empty' : 'ok', res.total, res.reason ?? null);
         }
         out.skipped++;
@@ -545,9 +670,13 @@ export async function collectImageDecks(
             ? `枠${img.slots}に対し${img.readSlots}枠しか読めなかった（読み落としなので採らない）`
             : res.reason === 'under_60'
               ? `読み取り${res.total}枚（60枚未満なので採らない）`
+              : res.reason === 'over_4_copies'
+              ? `1種5枚以上になった（${res.missing.slice(0, 4).join('・')}）＝同定の取り違えなので採らない`
               : res.reason === 'low_match'
-                ? 'カードを特定できない枠が多い'
-                : 'デッキ表の画像ではない';
+                ? // どのカード名で外したかを出す。これが無いと語彙側の問題か
+                  // 読み取り側の問題か切り分けられない
+                  `カードを特定できない枠が多い（${res.missing.slice(0, 6).join('・') || '不明'}）`
+                : `デッキ表の画像ではない（枠${img.slots}/読${img.readSlots}）`;
         out.results.push({ url: it.url, image: imageUrl, status: reason, total: res.total, fuzzy: res.fuzzy });
         continue;
       }
