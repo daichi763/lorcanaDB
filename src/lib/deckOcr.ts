@@ -45,6 +45,23 @@ export type OcrDeckRow = {
   cards: Array<{ name: string | null; qty: number | null }>;
 };
 
+/**
+ * デッキ画像の並び（段数と各段の枠数）。
+ *
+ * なぜ先にこれを取るか（実測による）:
+ *   段別読み取りだけだと2つの事故が起きた。
+ *     ・2段しかない画像に「3段目」を要求すると、モデルが空と答えず
+ *       既に読んだ段を再出力し、枚数が二重に加算された（85枚になった）。
+ *     ・ある段の枠を読み落としても気づけず、合計52枚のまま採否判定に回った。
+ *   段数と枠数を先に確定させ、読み取り結果の枠数と突き合わせれば
+ *   どちらも検出できる。枚数バッジより「枠を数える」方が視覚的に容易なので
+ *   この1回は安価かつ確実。
+ */
+export type OcrDeckLayout = {
+  isDeck: boolean;
+  rows: number[]; // 各段の枠数（上から順）
+};
+
 /** デッキ画像1枚の読み取り結果 */
 export type OcrDeckImage = {
   image_url: string;
@@ -52,42 +69,25 @@ export type OcrDeckImage = {
   rows: number;
   cards: Array<{ raw: string; qty: number }>;
   total: number;
+  /** レイアウト把握で数えた枠の総数（採否判定の検証に使う） */
+  slots: number;
+  /** 実際に読み取れた枠の数。slots と乖離していれば読み落としがある */
+  readSlots: number;
 };
 
-/** 段別OCRの1回分を実行する。1段ずつ読ませるのが精度の要（冒頭の設計2）*/
-async function readDeckRow(
+/**
+ * 画像1枚に対する Vision 呼び出しの共通処理。
+ * JSONにならない返答は「デッキ表でない」を意味するので null を返す（例外にしない）。
+ */
+async function visionJson(
   env: AiEnv,
   imageUrl: string,
-  row: number,
-  vocab: string[],
-  opts: { model?: string; timeoutMs?: number } = {}
-): Promise<OcrDeckRow> {
+  instruction: string,
+  opts: { model?: string; timeoutMs?: number; maxTokens?: number } = {}
+): Promise<any | null> {
   if (!aiConfigured(env)) throw new LlmError('ai_not_configured', 503);
   const base = String(env.OPENAI_BASE_URL).replace(/\/+$/, '');
   const model = opts.model || env.AI_MODEL || 'gpt-5-mini';
-
-  const instruction = [
-    'ディズニーロルカナ（日本語版）のデッキ画像を読み取る作業です。',
-    '',
-    '【画像の形式】',
-    'カード画像が格子状に並び、各カードの右上に丸いバッジ「x1」〜「x4」で枚数が書かれている。',
-    'カード名はカードのイラストの下の帯に書かれている。',
-    '',
-    `【今回読む範囲】画像の上から${row}段目の横一列だけ。他の段は読まない。`,
-    '',
-    '【各カードについて】',
-    '  ・枚数: 右上のバッジ「xN」。バッジは文字が大きいので確実に読める。',
-    '  ・カード名: 帯の文字。ただし【カード名一覧】に載っている名前の中から選ぶ。',
-    '    一覧に無い名前を創作してはいけない。',
-    '    読めた文字に最も近い一覧の名前を選ぶ。どれとも判断できない枠は name を null にする。',
-    '  ・枠は飛ばさず、左から右へ順に全部出す。',
-    '',
-    `【出力】JSONのみ。{"row":${row},"exists":true,"cards":[{"name":"カード名またはnull","qty":4}]}`,
-    `${row}段目が存在しない（カードが並んでいない）場合は exists:false, cards:[] とする。`,
-    '',
-    '【カード名一覧】',
-    vocab.join(' / '),
-  ].join('\n');
 
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 110_000);
@@ -113,7 +113,7 @@ async function readDeckRow(
         ],
         response_format: { type: 'json_object' },
         reasoning_effort: 'medium',
-        max_completion_tokens: 5_000,
+        max_completion_tokens: opts.maxTokens ?? 5_000,
       }),
       signal: ctrl.signal,
     });
@@ -125,19 +125,94 @@ async function readDeckRow(
 
   const raw = await res.text();
   if (!res.ok) throw new LlmError(`deck_ocr_http_${res.status}`, res.status);
-  let parsed: any;
   try {
     const outer = JSON.parse(raw);
-    parsed = JSON.parse(String(outer?.choices?.[0]?.message?.content ?? '{}'));
+    return JSON.parse(String(outer?.choices?.[0]?.message?.content ?? '{}'));
   } catch {
     /*
      * デッキ表でない画像（記事のアイキャッチ等）を渡すと、
      * モデルが「読み取れません」という散文を返して JSON にならない。
      * これは異常ではなく「その画像はデッキ表ではない」という結果なので、
-     * 例外にせず exists:false として返す（記事ごと失敗扱いにしないため）。
+     * 例外にせず null を返す（記事ごと失敗扱いにしないため）。
      */
-    return { exists: false, cards: [] };
+    return null;
   }
+}
+
+/**
+ * デッキ画像の並び（段数と各段の枠数）を先に確定させる。
+ * カード名も枚数も読ませない（枠を数えるだけなら精度が高い）。
+ */
+async function readDeckLayout(
+  env: AiEnv,
+  imageUrl: string,
+  opts: { model?: string } = {}
+): Promise<OcrDeckLayout> {
+  const instruction = [
+    'ディズニーロルカナのデッキ紹介画像かどうかを判定し、カードの並びを数える作業です。',
+    '',
+    '【デッキ紹介画像とは】',
+    'カード画像が格子状に並び、各カードの右上に丸いバッジ「x1」〜「x4」で枚数が書かれているもの。',
+    'カード1〜3枚を大きく解説した画像、買取価格表、メタ円グラフ、写真などは該当しない。',
+    '',
+    '【やること】',
+    '  1. デッキ紹介画像かどうかを判定する。',
+    '  2. 該当する場合、上から順に「各段に何枠並んでいるか」を数える。',
+    '     最後の段は途中で終わっていることが多いので、実際の枠数を数える。',
+    '     カード名や枚数は読まなくてよい。枠の数だけを正確に数える。',
+    '',
+    '【出力】JSONのみ。{"is_deck":true,"rows":[8,8,2]}',
+    'デッキ紹介画像でなければ {"is_deck":false,"rows":[]}',
+  ].join('\n');
+
+  const parsed = await visionJson(env, imageUrl, instruction, { model: opts.model, maxTokens: 1_500 });
+  if (!parsed) return { isDeck: false, rows: [] };
+  const rows = (Array.isArray(parsed?.rows) ? parsed.rows : [])
+    .map((n: unknown) => Number(n))
+    .filter((n: number) => Number.isInteger(n) && n >= 1 && n <= 14)
+    .slice(0, 8);
+  return { isDeck: parsed?.is_deck === true && rows.length > 0, rows };
+}
+
+/** 段別OCRの1回分を実行する。1段ずつ読ませるのが精度の要（冒頭の設計2）*/
+async function readDeckRow(
+  env: AiEnv,
+  imageUrl: string,
+  row: number,
+  vocab: string[],
+  opts: { model?: string; timeoutMs?: number; expectSlots?: number; totalRows?: number } = {}
+): Promise<OcrDeckRow> {
+  const instruction = [
+    'ディズニーロルカナ（日本語版）のデッキ画像を読み取る作業です。',
+    '',
+    '【画像の形式】',
+    'カード画像が格子状に並び、各カードの右上に丸いバッジ「x1」〜「x4」で枚数が書かれている。',
+    'カード名はカードのイラストの下の帯に書かれている。',
+    '',
+    opts.totalRows
+      ? `【画像の並び】この画像は全${opts.totalRows}段。今回読むのは上から${row}段目の横一列だけ。他の段は読まない。`
+      : `【今回読む範囲】画像の上から${row}段目の横一列だけ。他の段は読まない。`,
+    // 枠数を先に伝えると読み落とし（合計52枚になる事故）を防げる
+    opts.expectSlots ? `この段には${opts.expectSlots}枠ある。${opts.expectSlots}件すべて出力する。` : '',
+    '',
+    '【各カードについて】',
+    '  ・枚数: 右上のバッジ「xN」。バッジは文字が大きいので確実に読める。',
+    '  ・カード名: 帯の文字。ただし【カード名一覧】に載っている名前の中から選ぶ。',
+    '    一覧に無い名前を創作してはいけない。',
+    '    読めた文字に最も近い一覧の名前を選ぶ。どれとも判断できない枠は name を null にする。',
+    '  ・枠は飛ばさず、左から右へ順に全部出す。',
+    '',
+    `【出力】JSONのみ。{"row":${row},"exists":true,"cards":[{"name":"カード名またはnull","qty":4}]}`,
+    `${row}段目が存在しない（カードが並んでいない）場合は exists:false, cards:[] とする。`,
+    '',
+    '【カード名一覧】',
+    vocab.join(' / '),
+  ].filter(Boolean).join('\n');
+
+  const parsed = await visionJson(env, imageUrl, instruction, {
+    model: opts.model, timeoutMs: opts.timeoutMs,
+  });
+  if (!parsed) return { exists: false, cards: [] };
   const cards = Array.isArray(parsed?.cards) ? parsed.cards : [];
   return {
     exists: parsed?.exists !== false && cards.length > 0,
@@ -161,13 +236,34 @@ export async function readDeckImage(
   opts: { maxRows?: number; model?: string } = {}
 ): Promise<OcrDeckImage> {
   const maxRows = Math.max(1, Math.min(6, opts.maxRows ?? 4));
-  const out: OcrDeckImage = { image_url: imageUrl, kind: 'other', rows: 0, cards: [], total: 0 };
+  const out: OcrDeckImage = {
+    image_url: imageUrl, kind: 'other', rows: 0, cards: [], total: 0,
+    slots: 0, readSlots: 0,
+  };
 
-  for (let row = 1; row <= maxRows; row++) {
-    const r = await readDeckRow(env, imageUrl, row, vocab, { model: opts.model });
-    if (!r.exists || !r.cards.length) break;
+  // 1. まず並び（段数と各段の枠数）を確定させる。ここで非デッキ画像も弾ける
+  const layout = await readDeckLayout(env, imageUrl, { model: opts.model });
+  if (!layout.isDeck) return out;
+  const rows = layout.rows.slice(0, maxRows);
+  out.slots = layout.rows.reduce((a, b) => a + b, 0);
+
+  // 2. 段ごとに読む。枠数を伝えて読み落としを防ぎ、返ってきた枠数も検証する
+  for (let i = 0; i < rows.length; i++) {
+    const row = i + 1;
+    const expect = rows[i];
+    const r = await readDeckRow(env, imageUrl, row, vocab, {
+      model: opts.model, expectSlots: expect, totalRows: rows.length,
+    });
+    if (!r.exists || !r.cards.length) continue;
+    /*
+     * レイアウトで数えた枠数より多く返ってきた段は、
+     * モデルが他の段まで読んでいる（実測: 2段の画像で85枚になった事故）。
+     * 多い分を切り捨てず、その段は丸ごと捨てる。どこが余分か判別できないため。
+     */
+    if (r.cards.length > expect + 1) continue;
     out.rows = row;
     for (const c of r.cards) {
+      out.readSlots++;
       // 枚数が読めない枠は採らない。推測で埋めると枚数が嘘になる
       if (!c.name || !c.qty || c.qty < 1 || c.qty > 4) continue;
       out.cards.push({ raw: c.name, qty: c.qty });
@@ -188,7 +284,7 @@ export function resolveOcrDeck(
   index: CardIndex
 ): {
   ok: boolean;
-  reason?: 'not_deck' | 'under_60' | 'low_match';
+  reason?: 'not_deck' | 'missed_slots' | 'under_60' | 'low_match';
   total: number;
   fuzzy: number;
   cards: Array<{ card_id: number | null; card_name: string; raw: string; qty: number }>;
@@ -219,6 +315,14 @@ export function resolveOcrDeck(
   const total = cards.reduce((a, c) => a + c.qty, 0);
 
   if (img.kind !== 'deck' || cards.length < 8) return { ok: false, reason: 'not_deck', total, fuzzy, cards, missing };
+  /*
+   * レイアウトで数えた枠数と、読み取れた枠数が一致しなければ読み落としがある。
+   * 実測: 枠を1つ落としたまま合計52枚で判定に回った事故があった。
+   * 枠数が合っていない読み取りは、たとえ合計が60枚以上でも信用しない。
+   */
+  if (img.slots > 0 && img.readSlots < img.slots) {
+    return { ok: false, reason: 'missed_slots', total, fuzzy, cards, missing };
+  }
   // ロルカナのルールで60枚は下限。下回るのは読み落とし
   if (total < 60) return { ok: false, reason: 'under_60', total, fuzzy, cards, missing };
   const matched = cards.filter((c) => c.card_id).length;
@@ -322,6 +426,8 @@ export async function collectImageDecks(
     maxImagesPerArticle?: number;
     season?: string;
     model?: string;
+    /** 記事URLを直接指定して狙い撃ちする（収集一覧の順で埋もれる記事を試すため） */
+    urls?: string[];
   } = {}
 ): Promise<{
   scanned: number;
@@ -333,19 +439,25 @@ export async function collectImageDecks(
 }> {
   const maxArticles = Math.min(4, Math.max(1, opts.maxArticles ?? 1));
   const maxImages = Math.min(6, Math.max(1, opts.maxImagesPerArticle ?? 3));
-  const keys = opts.sourceKeys ?? ['note_lorcana_deck', 'note_lorcana', 'note_disney_lorcana'];
-  const ph = keys.map(() => '?').join(',');
-  const q = await db
-    .prepare(
-      `SELECT url, source_key, observed_at FROM meta_raw_items
-        WHERE source_key IN (${ph}) ORDER BY observed_at DESC LIMIT 200`
-    )
-    .bind(...keys)
-    .all();
-  const items = ((q.results ?? []) as any[]).map((r) => ({
-    url: String(r.url),
-    observed: r.observed_at ? dateOnly(String(r.observed_at)) : null,
-  }));
+  const explicit = (opts.urls ?? []).map((u) => String(u).trim()).filter(Boolean);
+  let items: Array<{ url: string; observed: string | null }>;
+  if (explicit.length) {
+    items = explicit.map((u) => ({ url: u, observed: null }));
+  } else {
+    const keys = opts.sourceKeys ?? ['note_lorcana_deck', 'note_lorcana', 'note_disney_lorcana'];
+    const ph = keys.map(() => '?').join(',');
+    const q = await db
+      .prepare(
+        `SELECT url, source_key, observed_at FROM meta_raw_items
+          WHERE source_key IN (${ph}) ORDER BY observed_at DESC LIMIT 200`
+      )
+      .bind(...keys)
+      .all();
+    items = ((q.results ?? []) as any[]).map((r) => ({
+      url: String(r.url),
+      observed: r.observed_at ? dateOnly(String(r.observed_at)) : null,
+    }));
+  }
 
   // すでに読んだ画像は二度読まない（Vision は遅くて高い）
   const doneImages = new Set<string>();
@@ -368,7 +480,7 @@ export async function collectImageDecks(
 
   const index = await buildCardIndex(db);
   const vocab = await cardNameVocab(db);
-  const pending = items.filter((it) => !skipArticles.has(it.url));
+  const pending = explicit.length ? items : items.filter((it) => !skipArticles.has(it.url));
   const batch = pending.slice(0, maxArticles);
 
   const out = {
@@ -419,15 +531,23 @@ export async function collectImageDecks(
       }
       const res = resolveOcrDeck(img, index);
       if (!res.ok) {
-        // 「デッキ表でない画像」も読み済みとして記録する（毎回読み直さない）
-        await markImageOcr(db, imageUrl, it.url, img.kind === 'deck' ? 'empty' : 'ok', res.total, res.reason ?? null);
+        /*
+         * 「デッキ表でない画像」は読み済みとして記録する（毎回読み直さない）。
+         * ただし missed_slots（読み落とし）は画像側の問題ではなく読み取りの失敗なので
+         * 記録せず、次回また挑戦できるようにする。
+         */
+        if (res.reason !== 'missed_slots') {
+          await markImageOcr(db, imageUrl, it.url, img.kind === 'deck' ? 'empty' : 'ok', res.total, res.reason ?? null);
+        }
         out.skipped++;
         const reason =
-          res.reason === 'under_60'
-            ? `読み取り${res.total}枚（60枚未満なので採らない）`
-            : res.reason === 'low_match'
-              ? 'カードを特定できない枠が多い'
-              : 'デッキ表の画像ではない';
+          res.reason === 'missed_slots'
+            ? `枠${img.slots}に対し${img.readSlots}枠しか読めなかった（読み落としなので採らない）`
+            : res.reason === 'under_60'
+              ? `読み取り${res.total}枚（60枚未満なので採らない）`
+              : res.reason === 'low_match'
+                ? 'カードを特定できない枠が多い'
+                : 'デッキ表の画像ではない';
         out.results.push({ url: it.url, image: imageUrl, status: reason, total: res.total, fuzzy: res.fuzzy });
         continue;
       }

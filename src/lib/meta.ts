@@ -1454,25 +1454,36 @@ export function extractDeckShareLinks(html: string): Array<{ inks: string[]; cod
  */
 export async function collectSocialDecks(
   db: D1Database,
-  opts: { sourceKeys?: string[]; maxArticles?: number; season?: string } = {}
+  opts: { sourceKeys?: string[]; maxArticles?: number; season?: string; urls?: string[] } = {}
 ): Promise<{ scanned: number; found: number; imported: number; skipped: number; remaining: number;
             rejected: Array<{ url: string; reason: string }> }> {
   const maxArticles = Math.min(12, Math.max(1, opts.maxArticles ?? 6));
-  const keys = opts.sourceKeys ?? [
-    'note_lorcana_deck', 'note_lorcana', 'note_disney_lorcana',
-    'x_official_jp', 'jp_community_post',
-  ];
-  const ph = keys.map(() => '?').join(',');
-  const q = await db
-    .prepare(
-      `SELECT url, source_key, observed_at FROM meta_raw_items
-        WHERE source_key IN (${ph}) ORDER BY observed_at DESC LIMIT 200`
-    )
-    .bind(...keys)
-    .all();
-  const items = ((q.results ?? []) as any[]).map((r) => ({
-    url: String(r.url), sourceKey: String(r.source_key), observed: r.observed_at ? dateOnly(String(r.observed_at)) : null,
-  }));
+  /*
+   * urls を渡した場合はその記事だけを見る（狙い撃ち用）。
+   * 収集済み一覧の並び順に埋もれて到達できない記事を試すために必要。
+   * 恒久除外リストも無視する（人が明示的に指定したものを優先する）。
+   */
+  const explicit = (opts.urls ?? []).map((u) => String(u).trim()).filter(Boolean);
+  let items: Array<{ url: string; sourceKey: string; observed: string | null }>;
+  if (explicit.length) {
+    items = explicit.map((u) => ({ url: u, sourceKey: 'manual', observed: null }));
+  } else {
+    const keys = opts.sourceKeys ?? [
+      'note_lorcana_deck', 'note_lorcana', 'note_disney_lorcana',
+      'x_official_jp', 'jp_community_post',
+    ];
+    const ph = keys.map(() => '?').join(',');
+    const q = await db
+      .prepare(
+        `SELECT url, source_key, observed_at FROM meta_raw_items
+          WHERE source_key IN (${ph}) ORDER BY observed_at DESC LIMIT 200`
+      )
+      .bind(...keys)
+      .all();
+    items = ((q.results ?? []) as any[]).map((r) => ({
+      url: String(r.url), sourceKey: String(r.source_key), observed: r.observed_at ? dateOnly(String(r.observed_at)) : null,
+    }));
+  }
 
   // 取り込み済み・恒久除外を除く
   const known = new Set<string>();
@@ -1490,7 +1501,7 @@ export async function collectSocialDecks(
   }
 
   const index = await buildCardIndex(db);
-  const pending = items.filter((it) => !skip.has(it.url));
+  const pending = explicit.length ? items : items.filter((it) => !skip.has(it.url));
   const batch = pending.slice(0, maxArticles);
 
   let found = 0; let imported = 0; let skipped = 0;

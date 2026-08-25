@@ -637,6 +637,10 @@ admin.post('/meta/decks/social', async (c) => {
     sourceKeys: Array.isArray(body?.sourceKeys) && body.sourceKeys.length
       ? body.sourceKeys.map((x: unknown) => String(x))
       : undefined,
+    // 記事URLを直接渡して狙い撃ちできる（収集一覧の順で埋もれる記事を試すため）
+    urls: Array.isArray(body?.urls) && body.urls.length
+      ? body.urls.map((x: unknown) => String(x))
+      : undefined,
   });
   return c.json({ done: out.remaining === 0, ...out });
 });
@@ -659,6 +663,10 @@ admin.post('/meta/decks/images', async (c) => {
     season: body?.season ? String(body.season) : undefined,
     sourceKeys: Array.isArray(body?.sourceKeys) && body.sourceKeys.length
       ? body.sourceKeys.map((x: unknown) => String(x))
+      : undefined,
+    // 記事URL直指定（デッキ表画像があると分かっている記事を狙い撃ちする）
+    urls: Array.isArray(body?.urls) && body.urls.length
+      ? body.urls.map((x: unknown) => String(x))
       : undefined,
     model: body?.model ? String(body.model) : undefined,
   });

@@ -560,8 +560,20 @@ console.log('\n[9] ソース定義の整合性');
     ok(/段目の横一列だけ/.test(dk), '段ごとに読ませる（一括読みでは精度が出ない）');
     ok(/total < 60/.test(dk), '読み取り結果が60枚未満なら採らない');
     ok(/low_match/.test(dk), '突合率が低い読み取りは採らない');
+    // 段別読み取りだけでは「読み落とし」と「段の重複読み」を検出できなかった
+    ok(/readDeckLayout/.test(dk), '先に段数と枠数を確定させる');
+    ok(/missed_slots/.test(dk), '枠を読み落とした読み取りは採らない');
+    ok(/readSlots < img\.slots/.test(dk), '読めた枠数と枠の総数を突き合わせる');
+    ok(/cards\.length > expect \+ 1/.test(dk), '枠数より多く返った段は捨てる（段の重複読み対策）');
+    ok(/res\.reason !== 'missed_slots'/.test(dk),
+       '読み落としは記録せず再挑戦できるようにする');
+    ok(/urls\?: string\[\]/.test(dk), '記事URLを直接指定して狙い撃ちできる');
+    ok(/urls\?: string\[\]/.test(mt), '共有リンク収集も記事URLを直接指定できる');
     ok(/カード名一覧/.test(dk), 'カード名はDBの語彙から選ばせる');
-    ok(!/ocr_text.*本文/.test(dk) && /deck_total=/.test(dk),
+    // ocr_text に bind するのは `deck_total=N` だけ。記事本文は渡していないこと。
+    // （コメント行に「ocr_text には本文を入れない」と書いてあるため、
+    //   コメントを含む素朴な否定マッチでは判定できない。bind 引数で見る）
+    ok(/\.bind\([^)]*deck_total=\$\{total\}/.test(dk),
        '非公式の本文は保存せず、枚数だけを記録する');
     ok(/\/meta\/decks\/images/.test(ad), '画像収集のエンドポイントがある');
     const noAuth2 = await fetch(`${BASE}/api/_ops/meta/decks/images`, {
