@@ -18,7 +18,7 @@
  *  6. TopDeck.gg の帰属表示が §1.3 の例外として実際に出ること
  */
 import { JSDOM } from 'jsdom';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 
 const BASE = 'http://localhost:3000';
 let pass = 0,
@@ -207,9 +207,26 @@ console.log('\n[6] フロント側スクリプトの静的検査');
   const idx = readFileSync('src/index.tsx', 'utf8');
   ok(/op-btn-meta-ocr/.test(idx), '管理画面に OCR ボタンがある');
 
-  const wf = readFileSync('.github/workflows/meta-daily.yml', 'utf8');
+  // ワークフロー定義の置き場所について:
+  //   Genspark の GitHub App トークンには `workflows` 権限が無く、
+  //   .github/workflows/ 配下のファイルは push が拒否される。
+  //   そのため定義は ops/ で管理し、利用者が手動で .github/workflows/ へ配置する。
+  //   （配置済みならそちらを優先して検査する）
+  const wfPath = existsSync('.github/workflows/meta-daily.yml')
+    ? '.github/workflows/meta-daily.yml'
+    : 'ops/github-workflow-meta-daily.yml';
+  const wf = readFileSync(wfPath, 'utf8');
   ok(/cron:\s*'0 13 \* \* \*'/.test(wf), 'cron が 13:00 UTC（=22:00 JST）');
-  ok(/meta\/collect/.test(wf) && /meta\/memory/.test(wf), 'ワークフローが4段を実行する');
+  ok(
+    /meta\/collect/.test(wf) &&
+      /meta\/ocr/.test(wf) &&
+      /meta\/aggregate/.test(wf) &&
+      /meta\/summarize/.test(wf) &&
+      /meta\/memory/.test(wf),
+    'ワークフローが5段（収集→OCR→集計→要約→記憶層）を実行する'
+  );
+  // OCR で落ちても集計・要約は続けたい（画像が読めなくても本文でレポートは作れる）
+  ok(/continue-on-error:\s*true/.test(wf), 'OCR段は失敗しても後続を止めない');
 }
 
 console.log('\n[7] 管理APIの認証ガード');

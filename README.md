@@ -10,6 +10,7 @@
   1,255 件のキーワード能力タグ、463 節の公式ルール
 - **ステータス**: **Cloudflare Pages に本番デプロイ済み（稼働中）** / サンドボックスでも稼働確認済み
 - **本番URL**: https://lorcana-fandb.pages.dev
+- **リポジトリ**: https://github.com/daichi763/lorcanaDB （`main`）
 
 ## 主な機能
 
@@ -333,8 +334,10 @@ Cloudflare Workers のCPU時間制限を避けるため、外部から駆動す�
 ⑤ memory    … レポートと集計を記憶層（meta_knowledge / meta_vectors）へ反映
 ```
 
-- **毎日 22:00（JST）** に GitHub Actions（`.github/workflows/meta-daily.yml`、
-  cron `0 13 * * *`）が①〜⑤を順に叩きます
+- **毎日 22:00（JST）** に GitHub Actions（cron `0 13 * * *`）が①〜⑤を順に叩きます
+  - ワークフロー定義は **`ops/github-workflow-meta-daily.yml`** にあります。
+    有効化するには**リポジトリ側で `.github/workflows/meta-daily.yml` に配置してください**
+    （下記「GitHub Actions の有効化」を参照）
 - **④が失敗しても既存レポートは書き換えません**（仕様§6：前日分の表示を維持）。
   フロントは `stale=true` を受けて「本日分は未生成のため、直近のレポートを表示しています」と明示します
 - APIキー未設定のソース（X / TopDeck.gg）は
@@ -370,12 +373,45 @@ Cloudflare Workers のCPU時間制限を避けるため、外部から駆動す�
 「OH MY CAFE（表参道ヒルズ）／15:15〜16:30／17:00〜18:15／未経験・初心者・中級者・上級者」
 といった開催情報が画像から取得できています。
 
+#### GitHub Actions の有効化（手動作業が必要）
+
+**リポジトリ**: https://github.com/daichi763/lorcanaDB （`main` ブランチ）
+
+Genspark から使える GitHub App トークンには `workflows` 権限が無いため、
+`.github/workflows/` 配下のファイルだけは自動 push できません
+（`refusing to allow a GitHub App to create or update workflow ... without workflows permission`）。
+コード本体は通常どおり push されます。
+
+そこで定義ファイルを `ops/github-workflow-meta-daily.yml` として管理しています。
+日次自動更新を有効にするには、**次の1回だけ手元で操作**してください。
+
+```bash
+git clone https://github.com/daichi763/lorcanaDB.git
+cd lorcanaDB
+mkdir -p .github/workflows
+git mv ops/github-workflow-meta-daily.yml .github/workflows/meta-daily.yml
+git commit -m "ci: 日次更新ワークフローを有効化"
+git push
+```
+
+（GitHub のウェブUIで `.github/workflows/meta-daily.yml` を新規作成し、
+`ops/github-workflow-meta-daily.yml` の内容を貼り付けても同じです）
+
+配置後、**Actions タブ → 「最新環境情報の日次更新」→ Run workflow** で
+cron を待たずに動作確認できます。
+
 #### GitHub Actions に必要な Secrets
 
-| Secret | 用途 |
-|---|---|
-| `SITE_BASE_URL` | 例 `https://lorcana-fandb.pages.dev` |
-| `ADMIN_PASSWORD` | 管理APIのログインパスワード（Cloudflare のシークレットと同じ値） |
+リポジトリの **Settings → Secrets and variables → Actions → New repository secret** で登録します。
+
+| Secret | 用途 | 設定する値 |
+|---|---|---|
+| `SITE_BASE_URL` | 叩き先のサイト | `https://lorcana-fandb.pages.dev`（末尾の `/` は付けない） |
+| `ADMIN_PASSWORD` | 管理APIのログインパスワード | Cloudflare 側の `ADMIN_PASSWORD` と**同じ値** |
+
+この2つが未設定のままだと、ワークフローは
+`::error::SITE_BASE_URL / ADMIN_PASSWORD シークレットが未設定です` で即座に停止します
+（誤った状態で走り続けないよう、あえて先頭で失敗させています）。
 
 #### Cloudflare のシークレット（任意・未設定でも動作）
 
