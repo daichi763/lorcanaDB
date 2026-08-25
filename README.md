@@ -400,6 +400,18 @@ git push
 配置後、**Actions タブ → 「最新環境情報の日次更新」→ Run workflow** で
 cron を待たずに動作確認できます。
 
+> ⚠️ **必ず最新版（コミット `6b88fb9` 以降）を取得してください。**
+> それより前の定義には、OCRループが1回で打ち切られる不具合がありました。
+> jq の `//`（代替演算子）は `null` だけでなく **`false` も「空」として扱う**ため、
+> `.done // true` と書くと `"done": false`（まだ残っている）が `true` に化けます。
+> ```
+> $ echo '{"done":false}' | jq -r '.done // true'
+> true          # ← false のはずが true になる
+> ```
+> 結果として毎晩「画像2枚だけOCRして終了」する状態でした。
+> 現在は `if .done == true then "yes" else "no" end` で厳密比較し、
+> `remaining == 0` も併せて確認しています（本番で全7ステップ実行確認済み）。
+
 #### GitHub Actions に必要な Secrets
 
 リポジトリの **Settings → Secrets and variables → Actions → New repository secret** で登録します。
@@ -412,6 +424,30 @@ cron を待たずに動作確認できます。
 この2つが未設定のままだと、ワークフローは
 `::error::SITE_BASE_URL / ADMIN_PASSWORD シークレットが未設定です` で即座に停止します
 （誤った状態で走り続けないよう、あえて先頭で失敗させています）。
+
+`gh` CLI なら以下でも登録できます。
+
+```bash
+gh secret set SITE_BASE_URL --body "https://lorcana-fandb.pages.dev" --repo daichi763/lorcanaDB
+gh secret set ADMIN_PASSWORD --repo daichi763/lorcanaDB   # 対話で入力（履歴に残らない）
+gh secret list --repo daichi763/lorcanaDB
+```
+
+**Secrets（暗号化・ログでマスクされる）と Variables（平文）を混同しないでください。**
+`ADMIN_PASSWORD` を Variables 側に入れると Actions のログに露出します。
+
+##### 本番での実行実績（2026-08-25 検証）
+
+ワークフローと同じ順序・同じ HTTP 呼び出しを本番へ実行し、7ステップ全て成功を確認しました。
+
+| ステップ | 結果 |
+|---|---|
+| ① 収集 | 16ソース / 265件を投入、`done:true` |
+| ② 画像OCR | 10回ループで `remaining` 19→0、`done:true` |
+| ③ 集計 | `events:12`（JP直近3行） |
+| ④ 要約 | HTTP 200 / `status:"published"` / **§1.3違反 0件** / `evidence_counts.ocr_jp:14` |
+| ⑤ 記憶層 | `inserted:16, embedded:16, remaining:0` |
+| 状態サマリ | `sources_fail: []`、OCR累計 31件 / 約10,263文字 |
 
 #### Cloudflare のシークレット（任意・未設定でも動作）
 
