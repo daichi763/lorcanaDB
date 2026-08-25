@@ -40,6 +40,8 @@ import {
 import {
   COLLECT_ORDER,
   closeJob,
+  collectJpDecksBySeason,
+  rematchDeckCards,
   collectOne,
   computeSnapshots,
   extractJpEvents,
@@ -544,6 +546,79 @@ admin.post('/meta/collect', async (c) => {
     remaining: pending.length,
     next: pending[0] ?? null,
   });
+});
+
+/**
+ * POST /meta/decks/season  { season: string, max?: number, pages?: number }
+ *
+ * 弾（シーズン）を指定してデッキレシピをまとめて取り込む。
+ *
+ * 日次収集（/meta/collect）は sitemap の新着順なので「今の環境のデッキを揃える」
+ * ことができない。弾が切り替わったときは、その弾のアーカイブから
+ * まとめて取り込む操作が必要になるため専用の入口を用意する。
+ *
+ * Workers の実行時間に収めるため1回あたり max 件までにして、
+ * 呼び出し側が remaining>0 の間くり返す（収集APIと同じ作法）。
+ */
+admin.post('/meta/decks/season', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const season = String(body?.season ?? '').trim();
+  if (!season) return c.json({ error: 'season_required', message: 'season（シーズンslug）を指定してください' }, 400);
+
+  const all = await loadSources(db);
+  const src = all.find((s) => s.key === 'jp_community_deck');
+  if (!src) return c.json({ error: 'source_missing', message: 'jp_community_deck が未登録です' }, 500);
+
+  const jobId = await openJob(db, 'collect');
+  const started = Date.now();
+  const out = await collectJpDecksBySeason(db, src, {
+    seasonSlug: season,
+    maxDecks: Number(body?.max) || 8,
+    maxPages: Number(body?.pages) || 12,
+  });
+  const elapsed = Date.now() - started;
+
+  await closeJob(db, jobId, {
+    status: out.status === 200 ? 'done' : 'failed',
+    ok: out.status === 200 ? 1 : 0,
+    fail: out.status === 200 ? 0 : 1,
+    newItems: out.imported,
+    message: `デッキ収集(${season}): 取込${out.imported} 除外${out.skipped} 残${out.remaining}`,
+    detail: { ...out, elapsed_ms: elapsed },
+  });
+  await log(
+    db,
+    jobId,
+    'meta_decks_season',
+    out.status === 200 ? 'info' : 'error',
+    `シーズン別デッキ収集 ${season}: 取込${out.imported} / 除外${out.skipped} / 残${out.remaining}`,
+    out
+  );
+
+  return c.json({
+    season,
+    done: out.remaining === 0,
+    found: out.found,
+    imported: out.imported,
+    skipped: out.skipped,
+    remaining: out.remaining,
+    rejected: out.rejected,
+    status: out.status,
+    elapsed_ms: elapsed,
+  });
+});
+
+/** 取り込み済みデッキの未突合カードを、現在の突合ロジックで再照合する */
+admin.post('/meta/decks/rematch', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const season = String(body?.season ?? '').trim() || undefined;
+  const out = await rematchDeckCards(c.env.DB, { season });
+  return c.json({ season: season ?? null, ...out });
 });
 
 /**

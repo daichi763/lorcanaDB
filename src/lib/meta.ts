@@ -838,8 +838,12 @@ export async function collectJpDecks(
       skipped++;
       continue;
     }
-    const ok = await importJpDeck(db, e.url, r.text, index, e.lastmod);
-    ok ? imported++ : skipped++;
+    const res = await importJpDeck(db, e.url, r.text, index, e.lastmod);
+    if (res.ok) imported++;
+    else {
+      skipped++;
+      await noteDeckSkip(db, e.url, src.key, res.reason ?? 'no_table', res.counted);
+    }
   }
 
   await markSource(db, src.key, 200);
@@ -849,12 +853,215 @@ export async function collectJpDecks(
 const deckIdFromUrl = (url: string) => url.match(/\/deck\/(\d+)/)?.[1] ?? url;
 
 /**
+ * 取り込めなかったデッキURLを記録する。
+ *
+ * 「取り込まなかった」という判断を残しておくと、件数が想定より少ないときに
+ * 通信で落ちたのか出典データが規定外なのかを後から切り分けられる。
+ * 試行回数も数えて、2回以上失敗したものは次回の取得対象から外す。
+ */
+async function noteDeckSkip(
+  db: D1Database,
+  url: string,
+  sourceKey: string,
+  reason: string,
+  counted?: number
+): Promise<void> {
+  // このテーブルが無い環境（マイグレーション未適用）でも収集自体は続行させる
+  try {
+    await db
+      .prepare(
+        `INSERT INTO meta_deck_skips (url, source_key, reason, counted, attempts, first_seen, last_seen)
+           VALUES (?,?,?,?,1,datetime('now'),datetime('now'))
+         ON CONFLICT(url) DO UPDATE SET
+           reason = excluded.reason,
+           counted = excluded.counted,
+           attempts = attempts + 1,
+           last_seen = datetime('now')`
+      )
+      .bind(url, sourceKey, reason, counted ?? null)
+      .run();
+  } catch {
+    /* 記録できなくても収集は成立する */
+  }
+}
+
+/**
+ * シーズン（弾）を指定して、そのシーズンのデッキレシピをまとめて取り込む。
+ *
+ * なぜ sitemap 経由の collectJpDecks とは別に用意するか:
+ *   sitemap は全402件が弾の区別なく lastmod 順に並ぶだけなので、
+ *   「13弾の環境のデッキが欲しい」という要求には応えられない。
+ *   一方このサイトは /deck/season/<slug>/ にシーズン別アーカイブを持ち、
+ *   ページ送りで当該シーズンのデッキだけを列挙できる。
+ *   弾が変わるたびに「その環境のデッキを揃える」操作が必要になるので、
+ *   シーズン指定を第一級の入口として実装する。
+ *
+ * 1回のリクエストで何十件も取ると Workers の実行時間に収まらないため、
+ * maxDecks で区切って呼び出し側が remaining>0 の間繰り返す方式にする。
+ * （収集は1件ごとに politeSleep を入れる。相手サーバへの配慮）
+ */
+export async function collectJpDecksBySeason(
+  db: D1Database,
+  src: SourceRow,
+  opts: { seasonSlug: string; maxDecks?: number; maxPages?: number } = { seasonSlug: '' }
+): Promise<{
+  status: number;
+  found: number;
+  imported: number;
+  skipped: number;
+  remaining: number;
+  rejected: Array<{ url: string; reason: string }>;
+}> {
+  const slug = String(opts.seasonSlug || '').trim();
+  if (!slug) return { status: 400, found: 0, imported: 0, skipped: 0, remaining: 0, rejected: [] };
+  const maxDecks = Math.max(1, Math.min(15, opts.maxDecks ?? 8));
+  const maxPages = Math.max(1, Math.min(20, opts.maxPages ?? 12));
+
+  // --- シーズンアーカイブをページ送りしてデッキURLを列挙 ---
+  const ids: string[] = [];
+  let lastStatus = 0;
+  for (let page = 1; page <= maxPages; page++) {
+    const url = page === 1
+      ? `${JP_COMMUNITY}/deck/season/${slug}/`
+      : `${JP_COMMUNITY}/deck/season/${slug}/page/${page}/`;
+    if (page > 1) await politeSleep();
+    const r = await politeFetch(url);
+    lastStatus = r.status;
+    // 最終ページを越えると 404。これは異常ではなく列挙の終端
+    if (r.status !== 200) break;
+    const found = [...r.text.matchAll(/https:\/\/disneylorcana\.jp\/deck\/(\d+)\//g)].map((m) => m[1]);
+    const before = ids.length;
+    for (const id of found) if (!ids.includes(id)) ids.push(id);
+    // 新しいIDが増えなかったら、同じページを見ている（ページ送りの終端）
+    if (ids.length === before) break;
+  }
+  if (!ids.length) {
+    await markSource(db, src.key, lastStatus || 0, `season ${slug}: デッキURLが取得できない`);
+    return { status: lastStatus || 0, found: 0, imported: 0, skipped: 0, remaining: 0, rejected: [] };
+  }
+
+  // --- 既に取り込んだものは飛ばす（再実行しても重複取得しない） ---
+  const known = new Set<string>();
+  {
+    const r = await db.prepare("SELECT deck_key FROM meta_decks WHERE region='jp'").all();
+    for (const row of (r.results ?? []) as any[]) known.add(String(row.deck_key));
+  }
+  /*
+   * 取り込めないと判定済みのURLも飛ばす。
+   * 出典側が60枚でないデータを載せている場合、除外しても meta_decks には
+   * 残らないので「未取得」と見え、繰り返すたびに毎回ダウンロードしていた。
+   * 相手サーバへの無駄な負荷になるうえ、1回の取得枠も食いつぶす。
+   *
+   * ただし永久除外はしない。出典が直せば取り込めるようになるので、
+   * 試行回数が少ないものは再挑戦の対象に残す。
+   */
+  const skipUrls = new Set<string>();
+  {
+    const r = await db
+      .prepare('SELECT url FROM meta_deck_skips WHERE attempts >= 2')
+      .all()
+      .catch(() => ({ results: [] as any[] }));
+    for (const row of (r.results ?? []) as any[]) skipUrls.add(String(row.url));
+  }
+  const pending = ids.filter(
+    (id) => !known.has(`jp:${id}`) && !skipUrls.has(`${JP_COMMUNITY}/deck/${id}/`)
+  );
+  const batch = pending.slice(0, maxDecks);
+
+  const index = await buildCardIndex(db);
+  let imported = 0;
+  let skipped = 0;
+  /*
+   * 取り込めなかったURLと理由を返す。
+   * 「30件欲しいのに集まらない」ときに、通信で落ちたのか
+   * 出典側のデータが60枚になっていないのかを切り分けられないと
+   * 追いかけようがないため。
+   */
+  const rejected: Array<{ url: string; reason: string }> = [];
+
+  for (const id of batch) {
+    const url = `${JP_COMMUNITY}/deck/${id}/`;
+    await politeSleep();
+    const r = await politeFetch(url);
+    if (r.status !== 200) {
+      skipped++;
+      rejected.push({ url, reason: `http ${r.status}` });
+      continue;
+    }
+    const res = await importJpDeck(db, url, r.text, index, null);
+    if (res.ok) imported++;
+    else {
+      skipped++;
+      await noteDeckSkip(db, url, src.key, res.reason ?? 'no_table', res.counted);
+      rejected.push({
+        url,
+        reason:
+          res.reason === 'not_60'
+            ? `出典データが${res.counted}枚（60枚ではない）`
+            : 'デッキ表が見つからない',
+      });
+    }
+  }
+
+  await markSource(db, src.key, 200);
+  return {
+    status: 200,
+    found: ids.length,
+    imported,
+    skipped,
+    remaining: Math.max(0, pending.length - batch.length),
+    rejected,
+  };
+}
+
+/**
+ * 出典サイトのカード表記を日本語版カードDBに突き合わせる。
+ *
+ * 表記は「キャラクター名 – バージョン名」形式が基本で、DB の card_group が
+ * 「キャラクター名／バージョン名」なので記号を落とせば一致する。
+ *
+ * ただしソング（曲）カードは日本語版でもカード名が英語のまま
+ * （例: DB は "We Don’t Talk About Bruno"）である一方、出典サイトは
+ * 「秘密のブルーノ – We Don't Talk About Bruno」のように日本語の通称を
+ * 前に付けて表記している。結合キーに日本語通称が混ざるため一致せず、
+ * 曲を多用するコントロール系デッキが軒並み「日本で組めない」と
+ * 誤判定されていた（実測: 6デッキ、未突合カード17種すべてが曲）。
+ *
+ * そこで区切り記号で分割し、全体で一致しなければ各断片でも照合する。
+ * アポストロフィの字種違い（' と ’）も吸収する（joinKey が記号を落とす）。
+ */
+export function matchJpDeckCardName(
+  raw: string,
+  index: CardIndex
+): { id: number; name: string } | null {
+  const whole = joinKey(String(raw ?? '').replace(/[–—-]/g, ''));
+  const direct = index.byJa.get(whole) ?? index.byEn.get(whole);
+  if (direct) return direct;
+
+  // 「日本語通称 – English Title」を分割して、断片ごとに照合する
+  const parts = String(raw ?? '')
+    .split(/[–—]|\s-\s/)
+    .map((s) => joinKey(s))
+    .filter((s) => s.length >= 2);
+  // 長い断片から試す（短い語ほど誤って別カードに当たりやすい）
+  for (const p of parts.sort((a, b) => b.length - a.length)) {
+    const hit = index.byJa.get(p) ?? index.byEn.get(p);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+/**
  * 日本のデッキ記事HTMLを構造化して取り込む。
  *
  * 記事には季節（環境シーズン）・大会・アーキタイプ・インク色・公開日と
  * 60枚のデッキ表（table.deckrecipelist02）が入っている。
  * カード名は「アリエル – 音響の戦士」形式で、DB の card_group は
  * 「アリエル／音響の戦士」なので記号を落として突合する。
+ *
+ * 戻り値は「取り込めたか」だけでなく理由と枚数も返す。
+ * 取り込まなかったデッキを毎回再取得しないよう記録するのに使う
+ * （出典側のデータが規定枚数と違う例が実在する）。
  */
 export async function importJpDeck(
   db: D1Database,
@@ -862,7 +1069,7 @@ export async function importJpDeck(
   html: string,
   index: CardIndex,
   lastmod: string | null
-): Promise<boolean> {
+): Promise<{ ok: boolean; reason?: 'no_table' | 'not_60'; counted?: number }> {
   const pick = (re: RegExp) => html.match(re);
   const season = pick(/href="https:\/\/disneylorcana\.jp\/deck\/season\/([^"/]+)\/">([^<]+)</);
   const event = pick(/href="https:\/\/disneylorcana\.jp\/deck\/event-tournament\/([^"/]+)\/">([^<]+)</);
@@ -872,13 +1079,21 @@ export async function importJpDeck(
   const observed = dateM ? `${dateM[1]}-${dateM[2]}-${dateM[3]}` : lastmod;
 
   const tableM = html.match(/<table class="deckrecipelist02[\s\S]*?<\/table>/);
-  if (!tableM) return false;
+  if (!tableM) return { ok: false, reason: 'no_table' };
 
   // 表の各行から「カード名」と「枚数」を取る
   const lines: Array<{ name: string; qty: number }> = [];
   for (const rowM of tableM[0].matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/g)) {
     const cells = [...rowM[1].matchAll(/<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/g)].map((m) => stripTags(m[1]));
     if (cells.length < 2) continue;
+    /*
+     * 表の最終行は合計行（例: 「41枚20枚」「61枚」）。
+     * 「数値だけのセル」条件をすり抜けないので枚数としては拾われないが、
+     * 一部のページでは合計欄の作りが違い、カード行として混入して
+     * 総枚数を狂わせる（実測: 900112 が 61 枚と算出されていた）。
+     * 「N枚」表記を含む行は集計行なので明示的に除外する。
+     */
+    if (cells.some((c) => /\d\s*枚/.test(c))) continue;
     // 枚数は数値だけのセル。カード名は日本語を含む最長セル
     const qtyCell = cells.find((c) => /^\d{1,2}$/.test(c));
     const nameCell = cells.find((c) => /[\u3040-\u30ff\u4e00-\u9fff]/.test(c) && c.length >= 2);
@@ -887,14 +1102,14 @@ export async function importJpDeck(
   }
 
   const total = lines.reduce((s, l) => s + l.qty, 0);
-  if (total !== 60) return false; // 60枚に満たない/超えるものは取り込まない
+  // 60枚に満たない/超えるものは取り込まない（デッキ構築の規定枚数）
+  if (total !== 60) return { ok: false, reason: 'not_60', counted: total };
 
   const deckKey = `jp:${deckIdFromUrl(url)}`;
   const missing: string[] = [];
   const cards: Array<{ card_id: number | null; card_name: string; raw: string; qty: number }> = [];
   for (const l of lines) {
-    const key = joinKey(l.name.replace(/[–—-]/g, ''));
-    const hit = index.byJa.get(key);
+    const hit = matchJpDeckCardName(l.name, index);
     if (hit) cards.push({ card_id: hit.id, card_name: hit.name, raw: l.name, qty: l.qty });
     else {
       missing.push(l.name);
@@ -942,7 +1157,7 @@ export async function importJpDeck(
 
   const deck = await db.prepare('SELECT id FROM meta_decks WHERE deck_key = ?').bind(deckKey).first<{ id: number }>();
   const deckId = Number(deck?.id ?? 0);
-  if (!deckId) return false;
+  if (!deckId) return { ok: false, reason: 'no_table' };
 
   const stmts: D1PreparedStatement[] = [
     db.prepare('DELETE FROM meta_deck_cards WHERE deck_id = ?').bind(deckId),
@@ -959,7 +1174,92 @@ export async function importJpDeck(
     );
   }
   await runBatched(db, stmts);
-  return true;
+  return { ok: true, counted: total };
+}
+
+/**
+ * すでに取り込み済みのデッキについて、未突合（card_id が null）のカード行を
+ * 現在の突合ロジックで再照合する。
+ *
+ * なぜ必要か: 突合ロジックを直しても、既存デッキは「取り込み済み」なので
+ * 収集処理が飛ばしてしまい、古い突合結果が残り続ける。出典を再取得すれば
+ * 直るが、59デッキ分の再ダウンロードは出典サイトに無駄な負荷をかける。
+ * カード名は meta_deck_cards.raw_name に残してあるので、DB内で完結できる。
+ *
+ * 実測: ソングカード対応の追加後、未突合55行のうち52行（曲カード）が解消。
+ */
+export async function rematchDeckCards(
+  db: D1Database,
+  opts: { season?: string } = {}
+): Promise<{ scanned: number; fixed: number; decksTouched: number; stillMissing: number }> {
+  const index = await buildCardIndex(db);
+  const where = opts.season ? 'AND d.season = ?' : '';
+  const binds = opts.season ? [opts.season] : [];
+  const r = await db
+    .prepare(
+      `SELECT mc.deck_id, mc.card_name, mc.raw_name, mc.qty
+         FROM meta_deck_cards mc JOIN meta_decks d ON d.id = mc.deck_id
+        WHERE mc.card_id IS NULL ${where}`
+    )
+    .bind(...binds)
+    .all();
+  const rows = (r.results ?? []) as any[];
+
+  const stmts: D1PreparedStatement[] = [];
+  const touched = new Set<number>();
+  let fixed = 0;
+  for (const row of rows) {
+    const raw = String(row.raw_name ?? row.card_name ?? '');
+    const hit = matchJpDeckCardName(raw, index);
+    if (!hit) continue;
+    const deckId = Number(row.deck_id);
+    /*
+     * card_name は主キーの一部なので、突合できた日本語版名に直すには
+     * 行を差し替える必要がある。差し替え先が既にある場合（同じカードが
+     * 別表記で2行に分かれていた場合）は枚数を足し込む。
+     */
+    stmts.push(
+      db
+        .prepare(
+          `INSERT INTO meta_deck_cards (deck_id,card_id,card_name,raw_name,qty)
+             VALUES (?,?,?,?,?)
+           ON CONFLICT(deck_id,card_name) DO UPDATE SET
+             card_id = excluded.card_id, qty = meta_deck_cards.qty + excluded.qty`
+        )
+        .bind(deckId, hit.id, hit.name, raw, Number(row.qty) || 1)
+    );
+    if (hit.name !== String(row.card_name)) {
+      stmts.push(
+        db
+          .prepare('DELETE FROM meta_deck_cards WHERE deck_id = ? AND card_name = ?')
+          .bind(deckId, String(row.card_name))
+      );
+    }
+    touched.add(deckId);
+    fixed++;
+  }
+  await runBatched(db, stmts);
+
+  // 触ったデッキの playable_jp / missing_cards を再計算する
+  for (const deckId of touched) {
+    const cs = await db
+      .prepare('SELECT card_id, card_name FROM meta_deck_cards WHERE deck_id = ?')
+      .bind(deckId)
+      .all();
+    const list = (cs.results ?? []) as any[];
+    if (!list.length) continue;
+    const miss = list.filter((c) => c.card_id == null).map((c) => String(c.card_name));
+    const playable = (list.length - miss.length) / list.length >= 0.9 ? 1 : 0;
+    await db
+      .prepare(
+        `UPDATE meta_decks SET playable_jp = ?, missing_cards = ?, updated_at = datetime('now')
+          WHERE id = ?`
+      )
+      .bind(playable, miss.length ? JSON.stringify(miss.slice(0, 40)) : null, deckId)
+      .run();
+  }
+
+  return { scanned: rows.length, fixed, decksTouched: touched.size, stillMissing: rows.length - fixed };
 }
 
 const INK_SLUG_JA: Record<string, string> = {
