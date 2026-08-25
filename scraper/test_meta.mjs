@@ -393,6 +393,37 @@ console.log('\n[8.5] 画像OCR（仕様§9-3）');
   ok(!/(x\.com|note\.com|twitter)/i.test(blob), '本文に非公式プラットフォーム名が出ない');
 }
 
+console.log('\n[8.6] レポートは全ブロック日本語で書かれる');
+{
+  // 実際に en_summary / en_topics が全文英語で出力される事故が起きたため回帰テスト化する。
+  // フィールド名の "en_" は「海外の話題」の意味であり、英語で書く指示ではない。
+  const jaRatio = (s) => {
+    const t = String(s || '').replace(/https?:\/\/\S+/g, '').replace(/\s/g, '');
+    if (!t.length) return 1;
+    return (t.match(/[ぁ-んァ-ヶ一-龥]/g) || []).length / t.length;
+  };
+  const R = await fetch(BASE + '/api/meta/report').then((r) => r.json()).then((d) => d.report || {});
+
+  for (const k of ['jp_summary', 'en_summary', 'diff_summary', 'upcoming_summary']) {
+    const v = R[k] || '';
+    if (!v) continue;
+    ok(jaRatio(v) >= 0.15, `${k} が日本語で書かれている (和文比率 ${jaRatio(v).toFixed(2)})`);
+  }
+  for (const key of ['jp_topics', 'en_topics']) {
+    for (const [i, t] of (R[key] || []).entries()) {
+      const v = `${t.title || ''}${t.body || ''}`;
+      if (v.replace(/\s/g, '').length < 12) continue;
+      ok(jaRatio(v) >= 0.15, `${key}[${i}] が日本語で書かれている (和文比率 ${jaRatio(v).toFixed(2)})`);
+    }
+  }
+  // 字数規定（仕様§1.2: 160〜300字）
+  for (const k of ['jp_summary', 'en_summary', 'upcoming_summary']) {
+    const n = String(R[k] || '').replace(/https?:\/\/\S+/g, '').replace(/\s/g, '').length;
+    if (!n) continue;
+    ok(n >= 160 && n <= 300, `${k} は規定字数 160〜300 に収まる (${n}字)`);
+  }
+}
+
 console.log('\n[9] ソース定義の整合性');
 {
   const pw = (readFileSync('.dev.vars', 'utf8').match(/^ADMIN_PASSWORD=(.*)$/m) || [])[1];

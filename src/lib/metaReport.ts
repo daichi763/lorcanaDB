@@ -682,6 +682,12 @@ export const REPORT_SYSTEM_PROMPT = `あなたはディズニー ロルカナ（
 - 材料が乏しいブロックは、無理に埋めず「現時点で確度の高い情報は限られる」旨を書いてよい。
 
 ## 3. 文体・表記
+- **出力する全フィールドの本文は必ず日本語で書く。** フィールド名の "en_" は
+  「海外の話題を扱うブロック」という意味であり、「英語で書け」という意味ではない。
+  en_summary / en_topics も**日本語の文章**で書く（英語で書いてはならない）。
+  材料が英語であっても、日本語に要約して書く。
+- 固有名詞（製品名・イベント名・企業名）は原語表記のままでよいが、
+  文そのものは日本語にする。例:「D23で新作デジタルゲームが発表された」
 - 「である調」で統一する。丁寧語（です・ます）は使わない。
 - インク色は日本語カラー名のみ: アンバー / アメジスト / エメラルド / ルビー / サファイア / スティール
 - 用語は日本語版準拠: インク、ロア、クエスト、チャレンジ、シフト、ボディガード、ラッシュ、エヴァシブ
@@ -692,12 +698,12 @@ export const REPORT_SYSTEM_PROMPT = `あなたはディズニー ロルカナ（
 必ず次のJSONオブジェクトのみを返す。前置き・後書き・コードフェンスは書かない。
 
 {
-  "jp_summary": "日本環境ハイライトの要約（160〜300字）",
-  "en_summary": "海外環境ハイライトの要約（160〜300字）",
-  "diff_summary": "日本と海外の共通点・分岐点（1〜2行、60〜160字）",
-  "upcoming_summary": "明日以降の予定の要約（160〜300字）",
-  "jp_topics": [{"title": "話題の見出し（20字以内）", "body": "本文（60〜140字）", "tag": "カード|デッキ|大会|ルール|未確認"}],
-  "en_topics": [{"title": "...", "body": "...", "tag": "..."}],
+  "jp_summary": "日本環境ハイライトの要約（日本語・160〜300字）",
+  "en_summary": "海外環境ハイライトの要約（★日本語で書く・160〜300字）",
+  "diff_summary": "日本と海外の共通点・分岐点（日本語・1〜2行、60〜160字）",
+  "upcoming_summary": "明日以降の予定の要約（日本語・160〜300字）",
+  "jp_topics": [{"title": "話題の見出し（日本語・20字以内）", "body": "本文（日本語・60〜140字）", "tag": "カード|デッキ|大会|ルール|未確認"}],
+  "en_topics": [{"title": "海外の話題の見出し（★日本語で書く・20字以内）", "body": "本文（★日本語で書く・60〜140字）", "tag": "カード|デッキ|大会|ルール|未確認"}],
   "spotlight_notes": [{"card_name": "与えられたカード名をそのまま", "note": "採用理由の解説（40〜100字）"}]
 }
 
@@ -881,6 +887,25 @@ export function jaLength(s: string): number {
 }
 
 /**
+ * 日本語で書かれているかを機械的に判定する。
+ *
+ * en_summary / en_topics は「海外の話題」を扱うブロックだが、フィールド名の "en_" を
+ * LLM が「英語で書け」と誤解して全文英語を返す事故が実際に起きた（本サイトは日本語向け）。
+ * プロンプトで指示するだけでは再発を防げないため、§1.3 と同様に機械側でも検知する。
+ *
+ * かな・カナ・漢字の比率で判定する。固有名詞や数値が多い文でも、日本語の文であれば
+ * 助詞（の・が・を・に）が必ず入るため 0.15 を下回ることはない。
+ */
+export function isJapanese(s: string): boolean {
+  const t = String(s ?? '')
+    .replace(/https?:\/\/\S+/g, '')
+    .replace(/\s/g, '');
+  if (t.length < 12) return true; // 短すぎる文字列は判定材料にならないので通す
+  const ja = (t.match(/[ぁ-んァ-ヶ一-龥]/g) || []).length;
+  return ja / t.length >= 0.15;
+}
+
+/**
  * LLM 出力を仕様どおりに整形する。
  * ここを通っていない文字列は絶対に DB / フロントへ出さない。
  */
@@ -899,6 +924,11 @@ export function sanitizeDraft(raw: any, spotlight: SpotlightCard[]): SanitizeRep
     if (n && (n < min || n > max)) lengthWarnings.push(`${field}: ${n}字 (規定 ${min}〜${max})`);
   };
 
+  /** 日本語で書かれていないブロックを violations として記録する（本サイトは日本語向け） */
+  const checkJa = (s: string, field: string) => {
+    if (s && !isJapanese(s)) violations.push(`${field}: 日本語で書かれていない（英語出力）`);
+  };
+
   const jp_summary = clean(raw?.jp_summary, 'jp_summary');
   const en_summary = clean(raw?.en_summary, 'en_summary');
   const diff_summary = clean(raw?.diff_summary, 'diff_summary');
@@ -909,6 +939,11 @@ export function sanitizeDraft(raw: any, spotlight: SpotlightCard[]): SanitizeRep
   checkLen(diff_summary, 'diff_summary', 40, 200);
   checkLen(upcoming_summary, 'upcoming_summary', 160, 300);
 
+  checkJa(jp_summary, 'jp_summary');
+  checkJa(en_summary, 'en_summary');
+  checkJa(diff_summary, 'diff_summary');
+  checkJa(upcoming_summary, 'upcoming_summary');
+
   const topics = (arr: unknown, field: string, max: number): Topic[] => {
     if (!Array.isArray(arr)) return [];
     return arr
@@ -916,6 +951,7 @@ export function sanitizeDraft(raw: any, spotlight: SpotlightCard[]): SanitizeRep
       .map((t: any, i) => {
         const title = clean(t?.title, `${field}[${i}].title`).slice(0, 40);
         const body = clean(t?.body, `${field}[${i}].body`).slice(0, 400);
+        checkJa(body, `${field}[${i}].body`);
         let tag = String(t?.tag ?? '').trim();
         if (!ALLOWED_TAGS.has(tag)) tag = 'デッキ';
         return { title, body, tag };
@@ -1031,16 +1067,40 @@ export async function generateReport(
   if (!aiConfigured(env)) throw new LlmError('ai_not_configured', 503);
 
   const model = opts.model || env.AI_MODEL || 'gpt-5-mini';
-  const { data, model: usedModel } = await chatJson<any>(
-    env,
-    [
-      { role: 'system', content: REPORT_SYSTEM_PROMPT },
-      { role: 'user', content: buildReportPrompt(ev) },
-    ],
-    { model, maxTokens: 6000, timeoutMs: 90_000, reasoningEffort: 'low' }
-  );
+  const userPrompt = buildReportPrompt(ev);
+  const call = (extra?: string) =>
+    chatJson<any>(
+      env,
+      [
+        { role: 'system', content: REPORT_SYSTEM_PROMPT },
+        { role: 'user', content: extra ? `${userPrompt}\n\n${extra}` : userPrompt },
+      ],
+      { model, maxTokens: 6000, timeoutMs: 90_000, reasoningEffort: 'low' }
+    );
 
-  const { draft, violations, lengthWarnings } = sanitizeDraft(data, ev.spotlight);
+  let { data, model: usedModel } = await call();
+  let sanitized = sanitizeDraft(data, ev.spotlight);
+
+  // en_summary / en_topics を英語で返してくる事故が実際に起きたため、
+  // 日本語違反を検知したら一度だけ再生成する（プロンプト指示だけでは防ぎきれない）。
+  // 再試行しても直らない場合は違反を記録したまま公開し、監視で気付けるようにする。
+  if (sanitized.violations.some((v) => v.includes('日本語で書かれていない'))) {
+    const retry = await call(
+      '【重要な訂正指示】前回の出力は英語で書かれていた。' +
+        'en_summary と en_topics も含め、すべての本文を必ず日本語で書き直すこと。' +
+        'フィールド名の "en_" は「海外の話題」という意味であり、英語で書く指示ではない。'
+    );
+    const retrySanitized = sanitizeDraft(retry.data, ev.spotlight);
+    const before = sanitized.violations.filter((v) => v.includes('日本語で書かれていない')).length;
+    const after = retrySanitized.violations.filter((v) => v.includes('日本語で書かれていない')).length;
+    if (after < before) {
+      data = retry.data;
+      usedModel = retry.model;
+      sanitized = retrySanitized;
+    }
+  }
+
+  const { draft, violations, lengthWarnings } = sanitized;
 
   // 注目カードにコメントを合流（コメントが無くてもカード自体は出す）
   const noteBy = new Map(draft.spotlight_notes.map((n) => [n.card_name, n.note]));
