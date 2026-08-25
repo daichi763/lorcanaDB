@@ -53,8 +53,10 @@ jobs:
             out=$(curl -sS -b /tmp/cookie.txt -X POST "$BASE/api/_ops/meta/collect" \
               -H 'content-type: application/json' -d '{}')
             echo "[$i] $out"
-            if [ "$(echo "$out" | jq -r '.done // false')" = "true" ] \
-               && [ "$(echo "$out" | jq -r '.remaining // 0')" = "0" ]; then
+            # jq の `//` は false も「空」扱いするため、真偽値は if-then-else で厳密に判定する
+            fin=$(echo "$out" | jq -r 'if .done == true then "yes" else "no" end' 2>/dev/null || echo no)
+            rest=$(echo "$out" | jq -r 'if .remaining == null then 0 else .remaining end' 2>/dev/null || echo 0)
+            if [ "$fin" = "yes" ] && [ "$rest" = "0" ]; then
               echo "収集完了"; break
             fi
             # 相手サイトへの負荷を避けるため各ソース間で待つ
@@ -76,7 +78,12 @@ jobs:
             out=$(curl -sS -b /tmp/cookie.txt -X POST "$BASE/api/_ops/meta/ocr" \
               -H 'content-type: application/json' -d '{"limit":2}' || echo '{}')
             echo "[$i] $(echo "$out" | jq -c '{ok,empty,failed,remaining,done}' 2>/dev/null || echo "$out")"
-            if [ "$(echo "$out" | jq -r '.done // true')" = "true" ]; then
+            # 注意: jq の `//` は null だけでなく **false も「空」として扱う**ため、
+            #   .done // true  と書くと "done":false（まだ残っている）が true に化けて
+            #   1回で打ち切られる。ここは必ず文字列として厳密比較する。
+            rest=$(echo "$out" | jq -r 'if .remaining == null then 0 else .remaining end' 2>/dev/null || echo 0)
+            fin=$(echo "$out" | jq -r 'if .done == true then "yes" else "no" end' 2>/dev/null || echo yes)
+            if [ "$fin" = "yes" ] || [ "$rest" = "0" ]; then
               echo "画像OCR完了"; break
             fi
             sleep 2
