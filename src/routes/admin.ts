@@ -58,6 +58,7 @@ import {
   metaVectorsReady,
   upsertKnowledge,
 } from '../lib/metaReport';
+import { ocrStats, runOcrBatch } from '../lib/ocr';
 
 const admin = new Hono<{ Bindings: Bindings }>();
 
@@ -446,7 +447,7 @@ admin.post('/update/faqs', async (c) => {
  *   工程を分け、収集はさらに1ソースずつ処理して呼び出し側（cron）が
  *   順に叩く構造にすることで、途中で失敗しても再開できる。
  *
- *   collect（1ソース/回） → aggregate → summarize → memory
+ *   collect（1ソース/回） → ocr（1画像/回） → aggregate → summarize → memory
  */
 
 /**
@@ -673,6 +674,58 @@ admin.post('/meta/memory', async (c) => {
   }
 });
 
+/**
+ * POST /meta/ocr  { limit?: number, days?: number, source?: string, retry_failed?: boolean }
+ *
+ * 収集済みの画像から文字を読む（仕様§9-3）。
+ * 日本公式Xの告知は本文が短く、開催時刻・対象レベル・会場が画像内にしか無いため、
+ * これを読まないと「明日以降の予定」ブロックが実質空になる。
+ *
+ * Vision呼び出しは1枚あたり数秒〜十数秒かかるので既定は1枚/回。
+ * 呼び出し側は done=true になるまで繰り返す（collect と同じ作法）。
+ */
+admin.post('/meta/ocr', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const body = await c.req.json().catch(() => ({}) as any);
+
+  const jobId = await openJob(db, 'ocr');
+  const started = Date.now();
+  try {
+    const r = await runOcrBatch(c.env, db, {
+      limit: Number(body?.limit) || 1,
+      days: Number(body?.days) || undefined,
+      sourceKey: body?.source ? String(body.source) : undefined,
+      retryFailed: Boolean(body?.retry_failed),
+    });
+    const elapsed = Date.now() - started;
+    await closeJob(db, jobId, {
+      status: r.failed && !r.ok ? 'failed' : 'done',
+      ok: r.ok + r.empty,
+      fail: r.failed,
+      newItems: r.ok,
+      message: `画像OCR: 読取${r.ok}件 / 文字なし${r.empty}件 / 失敗${r.failed}件（残${r.remaining}）`,
+      detail: { ...r, elapsed_ms: elapsed },
+    });
+    await log(
+      db,
+      jobId,
+      'meta_ocr',
+      r.failed && !r.ok ? 'error' : 'info',
+      `画像OCR 読取${r.ok}件（残${r.remaining}）`,
+      r
+    );
+    // r.ok は「読取に成功した枚数」なので、API の成否フラグとは別名で返す
+    return c.json({ success: true, ...r, elapsed_ms: elapsed });
+  } catch (e: any) {
+    const msg = String(e?.message ?? e).slice(0, 300);
+    await closeJob(db, jobId, { status: 'failed', fail: 1, message: msg });
+    await log(db, jobId, 'meta_ocr', 'error', `画像OCRに失敗: ${msg}`);
+    return c.json({ ok: false, error: msg }, 502);
+  }
+});
+
 /** GET /meta/status — 管理画面用。公開APIより詳しく、失敗理由まで返す */
 admin.get('/meta/status', async (c) => {
   const un = await requireAuth(c);
@@ -706,6 +759,7 @@ admin.get('/meta/status', async (c) => {
     `SELECT source_key, COUNT(*) AS n, MAX(observed_at) AS newest
        FROM meta_raw_items GROUP BY source_key ORDER BY n DESC`
   );
+  const ocr = await ocrStats(db).catch(() => null);
 
   // 母数は「日次収集の対象（COLLECT_ORDER にあり、かつ有効）」に限定する。
   // 例: lorcast_api は enabled=1 だがカードデータ参照専用でコレクタを持たないため、
@@ -727,6 +781,7 @@ admin.get('/meta/status', async (c) => {
     jobs,
     reports,
     raw_by_source: raw,
+    ocr,
   });
 });
 

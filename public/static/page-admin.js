@@ -363,6 +363,7 @@
    */
   const META_BTNS = [
     'op-btn-meta-collect',
+    'op-btn-meta-ocr',
     'op-btn-meta-aggregate',
     'op-btn-meta-summarize',
     'op-btn-meta-memory',
@@ -413,7 +414,46 @@
     pushLog(`収集を終了しました（成功${ok} / 失敗${ng}）`, ng ? 'warn' : 'ok');
   }
 
-  /** ② 集計（LLM不使用・決定的） */
+  /**
+   * ② 画像の文字を読取（OCR、仕様§9-3）
+   *
+   * 日本公式Xの告知は本文が短く、開催時刻・会場・対象レベルが画像内にしかない。
+   * Vision呼び出しは1枚10秒前後かかるので done になるまでここでループする。
+   */
+  async function metaOcr() {
+    pushLog('収集した画像から文字を読み取ります（公式告知番度）', 'info');
+    setProgress(10, '画像を読み取り中...');
+    let ok = 0;
+    let empty = 0;
+    let failed = 0;
+    // 1回2枚 × 30 = 最大60枚。これ以上は1日分の告知として現実的に起きない
+    for (let i = 0; i < 30; i++) {
+      const r = await call('/meta/ocr', { limit: 2 });
+      ok += r.ok || 0;
+      empty += r.empty || 0;
+      failed += r.failed || 0;
+      (r.items || []).forEach((it) => {
+        if (it.status === 'ok') {
+          pushLog(`読取 (${it.char_count}文字): ${it.preview}`, 'ok');
+        } else if (it.status === 'empty') {
+          pushLog('画像に文字が見つかりません（写真・イラストのみ）', 'warn');
+        } else {
+          pushLog(`読取失敗: ${it.error || 'unknown'}`, 'error');
+        }
+      });
+      const rest = r.remaining || 0;
+      setProgress(
+        Math.min(95, ((ok + empty + failed) / (ok + empty + failed + rest || 1)) * 100),
+        `画像を読み取り中... 完了${ok + empty + failed}枚 / 残り${rest}枚`
+      );
+      if (r.done || !rest) break;
+      await sleep(600);
+    }
+    setProgress(100, `画像OCR完了（読取${ok} / 文字なし${empty} / 失敗${failed}）`);
+    pushLog(`画像OCRを終了しました（読取${ok}枚 / 文字なし${empty}枚 / 失敗${failed}枚）`, failed ? 'warn' : 'ok');
+  }
+
+  /** ③ 集計（LLM不使用・決定的） */
   async function metaAggregate() {
     pushLog('イベント抽出とメタシェア集計を実行します', 'info');
     const r = await call('/meta/aggregate', {});
@@ -482,6 +522,12 @@
   /** ①〜④の連続実行。②以降は前段が失敗しても、可能な範囲で続行する */
   async function metaRunAll() {
     await metaCollect();
+    // OCRは失敗しても後続を止めない（本文だけでもレポートは作れる）
+    try {
+      await metaOcr();
+    } catch (e) {
+      pushLog(`画像OCRに失敗（本文のみで続行）: ${e.message}`, 'warn');
+    }
     await metaAggregate();
     try {
       await metaSummarize();
@@ -513,6 +559,12 @@
       (rep && rep.status !== 'published' ? `<span class="text-amber-300 ml-1">(${esc(rep.status)})</span>` : '') +
       `</span>` +
       `<span>環境情報の記憶: <b class="text-slate-100">${c.knowledge ?? 0}</b> 件（ベクトル ${c.vectors ?? 0}）</span>` +
+      (s.ocr
+        ? `<span>画像OCR: <b class="text-slate-100">${s.ocr.ok}</b> 枚読取（${s.ocr.chars}文字` +
+          (s.ocr.pending ? ` / 未処理 ${s.ocr.pending}枚` : '') +
+          (s.ocr.failed ? ` / 失敗 ${s.ocr.failed}枚` : '') +
+          `）</span>`
+        : '') +
       `</div>` +
       (failing.length
         ? `<div class="mt-1 text-amber-300">連続失敗中: ` +
@@ -543,6 +595,7 @@
 
     // 最新環境情報（日次更新）の4段
     $('op-btn-meta-collect')?.addEventListener('click', metaRunner(metaCollect, '収集'));
+    $('op-btn-meta-ocr')?.addEventListener('click', metaRunner(metaOcr, '画像OCR'));
     $('op-btn-meta-aggregate')?.addEventListener('click', metaRunner(metaAggregate, '集計'));
     $('op-btn-meta-summarize')?.addEventListener('click', metaRunner(metaSummarize, '要約生成'));
     $('op-btn-meta-memory')?.addEventListener('click', metaRunner(metaMemory, '記憶層への反映'));

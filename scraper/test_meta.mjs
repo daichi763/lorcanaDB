@@ -202,6 +202,10 @@ console.log('\n[6] フロント側スクリプトの静的検査');
   const pa = readFileSync('public/static/page-admin.js', 'utf8');
   ok(/\/meta\/collect/.test(pa) && /\/meta\/aggregate/.test(pa) && /\/meta\/summarize/.test(pa) && /\/meta\/memory/.test(pa), '管理画面が4段すべてを叩く');
   ok(/r\.done\s*&&\s*!r\.remaining/.test(pa), '収集は done かつ remaining=0 まで繰り返す');
+  ok(/\/meta\/ocr/.test(pa), '管理画面が画像OCRを叩く');
+  ok(/op-btn-meta-ocr/.test(pa), 'OCR ボタンのハンドラが登録されている');
+  const idx = readFileSync('src/index.tsx', 'utf8');
+  ok(/op-btn-meta-ocr/.test(idx), '管理画面に OCR ボタンがある');
 
   const wf = readFileSync('.github/workflows/meta-daily.yml', 'utf8');
   ok(/cron:\s*'0 13 \* \* \*'/.test(wf), 'cron が 13:00 UTC（=22:00 JST）');
@@ -279,7 +283,14 @@ console.log('\n[8] APIキー未設定ソースは「スキップ＝成功扱い�
     body: JSON.stringify({ source: 'x_official_jp' }),
   }).then((r) => r.json());
   ok(xx.ok === true, 'X 公式APIはトークン未設定でも失敗扱いにならない');
-  ok(xx.detail?.skipped === 'no_x_bearer_token', `スキップ理由が明示される (${xx.detail?.skipped})`);
+  // TopDeck と同じ二態。トークン設定済なら実収集され username が返る
+  const xSkipped = xx.detail?.skipped === 'no_x_bearer_token';
+  ok(
+    xSkipped || typeof xx.detail?.username === 'string',
+    xSkipped
+      ? 'トークン未設定時はスキップ理由が明示される (no_x_bearer_token)'
+      : `トークン設定済のため実収集された (@${xx.detail?.username} / 新規${xx.inserted}件)`
+  );
 
   // robots で禁止されているソースは収集しない
   // （無効化済みなので収集対象にならず、対象なしで完了として返る）
@@ -292,6 +303,77 @@ console.log('\n[8] APIキー未設定ソースは「スキップ＝成功扱い�
     rb.detail?.skipped === 'blocked_by_robots' || (rb.done === true && !rb.source),
     `robots 禁止ソースは収集対象にならない (${rb.detail?.skipped ?? '無効化済み'})`
   );
+}
+
+console.log('\n[8.5] 画像OCR（仕様§9-3）');
+{
+  const pw = (readFileSync('.dev.vars', 'utf8').match(/^ADMIN_PASSWORD=(.*)$/m) || [])[1];
+  const lg = await fetch(BASE + '/api/_ops/login', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ password: pw }),
+  });
+  const cookie = (lg.headers.get('set-cookie') || '').split(';')[0];
+  const H = { 'content-type': 'application/json', Cookie: cookie };
+
+  // OCR 対象の画像URLは収集時に保存されていること。
+  // 公式Xの告知は本文が短く、開催時刻や会場が画像内にしか無いため、
+  // ここで画像URLを取り逃すと「明日以降の予定」が実質空になる。
+  const st = await fetch(BASE + '/api/_ops/meta/status', { headers: { Cookie: cookie } }).then((r) => r.json());
+  ok(st.ocr && typeof st.ocr.total === 'number', 'OCR の集計が管理ステータスに載る');
+
+  // 1回1枚（resumable）で返り、done/remaining で進捗が分かること
+  const r1 = await fetch(BASE + '/api/_ops/meta/ocr', {
+    method: 'POST',
+    headers: H,
+    body: JSON.stringify({ limit: 1 }),
+  }).then((r) => r.json());
+  ok(r1.success === true, 'OCR エンドポイントが成功で返る');
+  ok(typeof r1.remaining === 'number' && typeof r1.done === 'boolean', 'OCR は done/remaining で再開可能');
+  ok(Array.isArray(r1.items), 'OCR は処理した画像の内訳を返す');
+
+  // 同じ画像を二度OCRしない（Vision呼び出しは有料なのでこれが崩れると課金が漏れ続ける）
+  const r2 = await fetch(BASE + '/api/_ops/meta/ocr', {
+    method: 'POST',
+    headers: H,
+    body: JSON.stringify({ limit: 1 }),
+  }).then((r) => r.json());
+  const urls1 = (r1.items || []).map((i) => i.image_url);
+  const urls2 = (r2.items || []).map((i) => i.image_url);
+  ok(
+    urls2.every((u) => !urls1.includes(u)),
+    '同じ画像を二度OCRしない（処理済みは候補から除外される）'
+  );
+
+  // 抽出結果は要約材料として渡っていること
+  const sm = await fetch(BASE + '/api/_ops/meta/summarize', {
+    method: 'POST',
+    headers: H,
+    body: JSON.stringify({ dry_run: true }),
+  }).then((r) => r.json());
+  ok(
+    sm.evidence_counts && typeof sm.evidence_counts.ocr_jp === 'number',
+    `OCR結果が要約材料に数えられる (ocr_jp=${sm.evidence_counts?.ocr_jp})`
+  );
+
+  // §1.3: 非公式画像のOCRは出典を表に出さない。
+  // 公開レポートに非公式ドメインのURLや@ハンドルが出ていないこと。
+  const rep = await fetch(BASE + '/api/meta/report').then((r) => r.json());
+  const R = rep.report || {};
+  const blob = [
+    R.jp_summary, R.en_summary, R.diff_summary, R.upcoming_summary,
+    ...(R.jp_topics || []).map((t) => `${t.title} ${t.body}`),
+    ...(R.en_topics || []).map((t) => `${t.title} ${t.body}`),
+    ...(R.spotlight_cards || []).map((s) => s.note || ''),
+  ].filter(Boolean).join('\n');
+  const OFFICIAL = ['takaratomy.co.jp', 'disneylorcana.com', 'ravensburgerplay.com'];
+  const urls = blob.match(/https?:\/\/[^\s、。）)]+/g) || [];
+  ok(
+    urls.every((u) => OFFICIAL.some((h) => u.includes(h))),
+    `本文中のURLは公式ドメインのみ (${urls.length}件検査)`
+  );
+  ok(!/@[A-Za-z0-9_]{2,}/.test(blob), '本文に @ハンドルが出ない（非公式の出典非表示）');
+  ok(!/(x\.com|note\.com|twitter)/i.test(blob), '本文に非公式プラットフォーム名が出ない');
 }
 
 console.log('\n[9] ソース定義の整合性');

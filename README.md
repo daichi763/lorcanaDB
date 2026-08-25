@@ -79,6 +79,7 @@
 | POST | `/api/_ops/update/rules-mark` | 取り込み済みバージョンの記録 |
 | POST | `/api/_ops/update/faqs` | 公式ルールQ&A（79件）の取得・更新 |
 | POST | `/api/_ops/meta/collect` | 最新環境情報の収集（1回に1ソース。`{done, remaining, next}` を返す） |
+| POST | `/api/_ops/meta/ocr` | 収集した画像の日本語OCR（1回に1〜4枚。`{done, remaining}` を返す） |
 | POST | `/api/_ops/meta/aggregate` | イベント抽出とメタシェア集計（LLM不使用） |
 | POST | `/api/_ops/meta/summarize` | LLM要約の生成（失敗時は前日分を維持） |
 | POST | `/api/_ops/meta/memory` | 環境情報を記憶層へ反映 |
@@ -300,7 +301,7 @@ TopDeck.gg については **「本文の文体は§1.3のまま（集約表現�
 |---|---|---|
 | 公式（日本） | タカラトミー ニュース / コラム / イベント | 有効・出典リンク可 |
 | 公式（海外） | Ravensburger ニュース / Recap | 有効・出典リンク可 |
-| 公式X | `@lorcana_jp` / `@DisneyLorcana` | `X_BEARER_TOKEN` 設定時に有効 |
+| 公式X | `@DisneyLOR_JP`（日本・約5.8万フォロワー） / `@DisneyLorcana`（海外・約5.3万） | `X_BEARER_TOKEN` 設定時に有効（Pay Per Use プランで稼働確認済み） |
 | 集計 | lorcanahunter メタ集計（`/en/meta`）・大会サイトマップ | 有効（本文は取得せず、集計値と見出しのみ） |
 | 大会API | **TopDeck.gg**（`POST /api/v2/tournaments`） | `TOPDECK_API_KEY` 設定時に有効・**可視クレジット必須** |
 | 海外サイト | tcgcontender / elorcana（サイトマップの新着のみ） | 有効 |
@@ -320,25 +321,54 @@ tcgcontender / topdeck）については `allow_memory=0` を設定し、
 **当日の要約材料としてのみ使用し、記憶層（ベクトルDB）へは永続化しません**
 （永続化は「学習利用」と読めるため）。
 
-### 更新パイプライン（4段）
+### 更新パイプライン（5段）
 
 Cloudflare Workers のCPU時間制限を避けるため、外部から駆動する分割方式です。
 
 ```
 ① collect   … 1回のリクエストで1ソースだけ取得（done/remaining で進捗を返す）
-② aggregate … イベント抽出・メタシェア集計（LLM不使用・決定的）
-③ summarize … LLMで要約生成 → scrubText() で引用方針を機械的に強制
-④ memory    … レポートと集計を記憶層（meta_knowledge / meta_vectors）へ反映
+② ocr       … 収集した画像の文字を読む（1回1〜4枚・Vision）
+③ aggregate … イベント抽出・メタシェア集計（LLM不使用・決定的）
+④ summarize … LLMで要約生成 → scrubText() で引用方針を機械的に強制
+⑤ memory    … レポートと集計を記憶層（meta_knowledge / meta_vectors）へ反映
 ```
 
 - **毎日 22:00（JST）** に GitHub Actions（`.github/workflows/meta-daily.yml`、
-  cron `0 13 * * *`）が①〜④を順に叩きます
-- **③が失敗しても既存レポートは書き換えません**（仕様§6：前日分の表示を維持）。
+  cron `0 13 * * *`）が①〜⑤を順に叩きます
+- **④が失敗しても既存レポートは書き換えません**（仕様§6：前日分の表示を維持）。
   フロントは `stale=true` を受けて「本日分は未生成のため、直近のレポートを表示しています」と明示します
 - APIキー未設定のソース（X / TopDeck.gg）は
   `{ok:true, detail:{skipped:'no_…'}}` を返す**スキップ扱い**なので、日次ジョブは落ちません
-- 管理画面（`/_ops`）からも同じ4段を手動実行できます
-  （①は完了までフロント側でループします）
+- 管理画面（`/_ops`）からも同じ5段を手動実行できます
+  （①②は完了までフロント側でループします）
+- ②は失敗しても後続を止めません（画像が読めなくても本文だけでレポートは作れます）
+
+#### 画像の日本語OCR（仕様§9-3）
+
+日本公式Xの告知は**本文が極端に短く、開催時刻・会場・対象レベル・賞品が画像の中にしか入っていません**。
+実測では公式メディアの `alt_text` は**全件空**でした。つまり画像を読まない限り、
+「明日以降の予定」ブロックは実質的に空になります。
+
+そこで収集時に画像URLを保存し（`meta_raw_items.image_urls`、1ポスト最大4枚）、
+`POST /api/_ops/meta/ocr` が Vision モデルで文字を書き起こして `meta_ocr` に保存します。
+
+| 設計 | 理由 |
+|---|---|
+| **1回1〜4枚で返す**（既定1枚） | Vision 呼び出しは1枚10秒前後。Workers の実行時間上限に収まらないため collect と同じ再開可能方式に揃える |
+| **同じ画像は二度OCRしない**（`image_url` が UNIQUE） | Vision は有料。失敗も `status='failed'` で行を残し、落ちる画像に毎日課金しない |
+| **公式を先に処理**（`is_official DESC`） | 予算が尽きても、価値の高い公式告知画像は読めている状態にする |
+| **対象は直近30日のみ** | 過去の全画像を読み返す動作が原理的に起きない |
+| **要約・言い換えをさせない** | プロンプトで「写すだけ。日付・時刻を推測で補完しない」と明示。OCRの誤読が新しい誤情報にならないようにする |
+
+引用方針（§1.3）もOCRに適用します。
+
+- **公式画像のOCR** … 公式1次情報の一部として扱い、URLをリンクにできる（プロンプト材料 `材料D2`）
+- **非公式画像のOCR** … 非公式本文と同じ扱い。材料としてのみ使い、**ソース名・URL・アカウント名は出さない**（`材料D3`）
+
+実測（2026-08-25 時点）: 公式Xの画像14枚のうち13枚から**計約4,400文字**を抽出。
+例として、本文135文字のポストからは読めない
+「OH MY CAFE（表参道ヒルズ）／15:15〜16:30／17:00〜18:15／未経験・初心者・中級者・上級者」
+といった開催情報が画像から取得できています。
 
 #### GitHub Actions に必要な Secrets
 
@@ -351,7 +381,7 @@ Cloudflare Workers のCPU時間制限を避けるため、外部から駆動す�
 
 | シークレット | 用途 |
 |---|---|
-| `X_BEARER_TOKEN` | X 公式API（有料プラン）。未設定ならX系ソースはスキップ |
+| `X_BEARER_TOKEN` | X 公式API（Pay Per Use プランで稼働確認済み）。未設定ならX系ソースはスキップ。**トークンは取得時のURLエンコード形（`%2F` `%2B` `%3D` を含む形）のまま設定すること**（デコードすると401になる） |
 | `TOPDECK_API_KEY` | TopDeck.gg 大会API。未設定ならスキップ |
 
 ### 時刻の扱い（3種を混同しない）
@@ -392,7 +422,7 @@ Cloudflare Workers のCPU時間制限を避けるため、外部から駆動す�
 
 **管理API**: `POST /api/_ops/meta/{collect,aggregate,summarize,memory}`、`GET /api/_ops/meta/status`
 
-### テーブル（`migrations/0005`〜`0008`）
+### テーブル（`migrations/0005`〜`0009`）
 
 | テーブル | 内容 |
 |---|---|
@@ -401,6 +431,7 @@ Cloudflare Workers のCPU時間制限を避けるため、外部から駆動す�
 | `meta_events` | イベント（`event_key` で冪等 upsert、`scale` = major/challenge/local） |
 | `meta_snapshots` | メタシェア集計（`detail.source` に出自を記録） |
 | `meta_decks` / `meta_deck_cards` | デッキレシピと明細（`playable_jp` フラグつき） |
+| `meta_ocr` | 画像内テキストのOCR結果（`image_url` が UNIQUE ＝ 同じ画像は二度読まない） |
 | `meta_reports` | 日次レポート（`status='published'` のみ公開） |
 | `meta_knowledge` / `meta_vectors` | 記憶層（256次元・`allow_memory=0` のソースは入れない） |
 | `meta_jobs` / `meta_logs` | ジョブ履歴と、引用方針の自動修正ログ |

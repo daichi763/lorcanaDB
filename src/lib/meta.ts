@@ -191,6 +191,11 @@ export type RawItem = {
   excerpt: string;
   observed_at: string | null;
   image_url?: string | null;
+  /**
+   * 記事/ポストに付いていた画像を全部保持する（OCR待ちの行列）。
+   * image_url は1枚しか持てないが、X のポストは最大4枚付くため。
+   */
+  image_urls?: string[] | null;
   kind?: string;
   meta?: Record<string, any>;
 };
@@ -256,12 +261,13 @@ export async function upsertRawItems(
         .prepare(
           `INSERT INTO meta_raw_items
              (source_key,url,url_hash,title,excerpt,body_hash,lang,region,kind,
-              observed_at,fetched_at,citable,trust,image_url,summarized_at,meta_json)
-           VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),?,?,?,NULL,?)
+              observed_at,fetched_at,citable,trust,image_url,image_urls,summarized_at,meta_json)
+           VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'),?,?,?,?,NULL,?)
            ON CONFLICT(url_hash) DO UPDATE SET
              title=excluded.title, excerpt=excluded.excerpt, body_hash=excluded.body_hash,
              observed_at=excluded.observed_at, fetched_at=datetime('now'),
-             image_url=excluded.image_url, meta_json=excluded.meta_json,
+             image_url=excluded.image_url, image_urls=excluded.image_urls,
+             meta_json=excluded.meta_json,
              -- 内容が変わったので再要約の対象に戻す
              summarized_at=NULL`
         )
@@ -279,6 +285,7 @@ export async function upsertRawItems(
           src.is_official,
           src.trust,
           p.item.image_url ?? null,
+          p.item.image_urls?.length ? JSON.stringify(p.item.image_urls).slice(0, 2000) : null,
           p.item.meta ? JSON.stringify(p.item.meta).slice(0, 2000) : null
         )
     );
@@ -1759,7 +1766,12 @@ export async function collectXUser(
   await politeSleep();
   const t = await xApi(token, `users/${u.json.data.id}/tweets`, {
     max_results: String(Math.max(5, Math.min(100, opts.maxPosts ?? 10))),
-    'tweet.fields': 'created_at,entities',
+    'tweet.fields': 'created_at,entities,attachments',
+    // 画像を取るための展開（仕様§9-3のOCR用）。
+    // 日本の公式Xは開催日時や応募締切を画像に載せるため、
+    // 本文だけでは日次まとめの材料にならない。
+    expansions: 'attachments.media_keys',
+    'media.fields': 'url,preview_image_url,type,alt_text',
     exclude: 'retweets,replies',
   });
   if (t.status !== 200) {
@@ -1767,18 +1779,36 @@ export async function collectXUser(
     return { status: t.status, ...empty };
   }
 
+  // media_key -> 画像URL の対応表。動画/GIF はサムネイルしか取れないので除外する
+  // （サムネにはテキストが乗らないことが多く、OCRの費用対効果が悪い）
+  const mediaMap = new Map<string, string>();
+  for (const m of (t.json?.includes?.media ?? []) as any[]) {
+    const key = String(m?.media_key ?? '');
+    if (!key || m?.type !== 'photo') continue;
+    const url = String(m?.url ?? m?.preview_image_url ?? '');
+    if (url) mediaMap.set(key, url);
+  }
+
   const posts: XPost[] = (t.json?.data ?? []) as XPost[];
   const items: RawItem[] = posts
     .filter((p) => p.id && p.text)
-    .map((p) => ({
-      url: `https://x.com/${username}/status/${p.id}`,
-      // タイトルは1行目。ポスト全文はタイトルにしない
-      title: p.text.split('\n')[0].slice(0, 120) || `@${username} のポスト`,
-      // 非公式は 200字、公式は 400字。いずれも本文全体は保存しない
-      excerpt: p.text.slice(0, src.is_official ? 400 : 200),
-      observed_at: dateOnly(p.created_at),
-      meta: { platform: 'x', username, post_id: p.id },
-    }));
+    .map((p) => {
+      const keys: string[] = ((p as any)?.attachments?.media_keys ?? []) as string[];
+      const images = keys.map((k) => mediaMap.get(k)).filter((v): v is string => Boolean(v));
+      // alt_text があればそれ自体が本文級の情報だが、実測では公式も全件空だった。
+      // よって画像は OCR 工程に回す前提で URL だけ保持する。
+      return {
+        url: `https://x.com/${username}/status/${p.id}`,
+        // タイトルは1行目。ポスト全文はタイトルにしない
+        title: p.text.split('\n')[0].slice(0, 120) || `@${username} のポスト`,
+        // 非公式は 200字、公式は 400字。いずれも本文全体は保存しない
+        excerpt: p.text.slice(0, src.is_official ? 400 : 200),
+        observed_at: dateOnly(p.created_at),
+        image_url: images[0] ?? null,
+        image_urls: images.length ? images.slice(0, 4) : null,
+        meta: { platform: 'x', username, post_id: p.id, images: images.length },
+      };
+    });
 
   const res = await upsertRawItems(db, src, items);
   await markSource(db, src.key, 200);

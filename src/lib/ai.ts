@@ -109,6 +109,118 @@ export async function chatJson<T>(
   return { data, usage: env2?.usage ?? null, model: env2?.model ?? model };
 }
 
+// ============================ 画像OCR（Vision） ============================
+/**
+ * 画像に写っている日本語テキストを書き起こす（仕様§9-3）。
+ *
+ * なぜ必要か
+ *   日本の公式Xは、開催日時・対象レベル・応募締切・注意事項といった
+ *   肝心な情報を「画像」に載せて投稿する。ポスト本文は
+ *   「【イベント情報🏰】…開催決定✨」程度しか書かれていないことが多い。
+ *   alt_text は実測で全件空だった。画像を読まないと日次まとめの
+ *   材料として使えないため、Vision モデルに文字を書き起こさせる。
+ *
+ * 方針
+ *   * 「書かれている文字を写す」ことだけをさせる。読み取れない箇所を
+ *     推測で補わせない（存在しない日付を創作されるのが最悪の事故）。
+ *   * 解釈・要約はここではしない。要約は後段の metaReport 側の仕事。
+ *   * 文字が無い画像（写真だけ等）は空文字を返させ、呼び出し側が
+ *     status='empty' として扱う。無理に何か書かせない。
+ *   * chatJson は content が文字列前提なので流用できない。
+ *     Vision は content を配列（text + image_url）で送る必要がある。
+ */
+export async function ocrImage(
+  env: AiEnv,
+  imageUrl: string,
+  opts: { model?: string; timeoutMs?: number; maxChars?: number } = {}
+): Promise<{ text: string; model: string; usage: unknown }> {
+  if (!aiConfigured(env)) throw new LlmError('ai_not_configured', 503);
+
+  const model = opts.model || env.AI_MODEL || 'gpt-5-mini';
+  const base = String(env.OPENAI_BASE_URL).replace(/\/+$/, '');
+  const maxChars = opts.maxChars ?? 1_800;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 60_000);
+
+  const instruction = [
+    'あなたは画像内の文字を正確に書き起こす作業者です。',
+    '',
+    '【指示】',
+    '1. 画像に写っている文字を、書かれているとおりに日本語で書き出す。',
+    '2. 読み取れない文字は無理に推測せず、その部分は書かない。',
+    '   特に日付・時刻・数値を推測で補完してはならない（誤情報になる）。',
+    '3. 意味の要約・言い換え・補足説明はしない。写すだけ。',
+    '4. 装飾記号や絵文字は省いてよい。改行は \\n で表す。',
+    '5. 文字が写っていない画像（写真やイラストのみ）の場合は空文字を返す。',
+    '',
+    `【出力】JSON で {"text": "書き起こし"} のみ。${maxChars}文字以内。`,
+  ].join('\n');
+
+  let res: Response;
+  try {
+    res = await fetch(`${base}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              { type: 'text', text: instruction },
+              { type: 'image_url', image_url: { url: imageUrl } },
+            ],
+          },
+        ],
+        response_format: { type: 'json_object' },
+        reasoning_effort: 'low',
+        max_completion_tokens: 2_500,
+      }),
+      signal: ctrl.signal,
+    });
+  } catch (e: any) {
+    clearTimeout(timer);
+    throw new LlmError(e?.name === 'AbortError' ? 'ocr_timeout' : 'ocr_network_error', 504);
+  }
+  clearTimeout(timer);
+
+  const raw = await res.text();
+  if (!res.ok) {
+    throw new LlmError(
+      `ocr_upstream_${res.status}: ${raw.slice(0, 200)}`,
+      res.status === 429 ? 429 : 502
+    );
+  }
+
+  let envelope: any;
+  try {
+    envelope = JSON.parse(raw);
+  } catch {
+    throw new LlmError('ocr_bad_envelope');
+  }
+  const content = envelope?.choices?.[0]?.message?.content;
+  if (typeof content !== 'string') throw new LlmError('ocr_empty_response');
+
+  let text = '';
+  try {
+    text = String(JSON.parse(content)?.text ?? '');
+  } catch {
+    const m = content.match(/\{[\s\S]*\}/);
+    if (m) {
+      try { text = String(JSON.parse(m[0])?.text ?? ''); } catch { /* 諦めて空 */ }
+    }
+  }
+
+  return {
+    text: text.trim().slice(0, maxChars),
+    model: envelope?.model ?? model,
+    usage: envelope?.usage ?? null,
+  };
+}
+
 // ============================ メカニクス辞書 ============================
 /**
  * 効果テキストからゲーム上の「動き」を抽出するための辞書。

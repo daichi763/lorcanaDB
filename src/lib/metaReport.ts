@@ -296,6 +296,12 @@ export type Evidence = {
   /** 非公式（材料としてのみ。ソース名は出さない） */
   material_jp: EvidenceItem[];
   material_en: EvidenceItem[];
+  /**
+   * 画像内テキストのOCR結果（仕様§9-3）。
+   * 公式画像のOCRは公式1次情報の一部として扱う（citable=1）。
+   * 非公式画像のOCRは非公式本文と同じ扱い（材料のみ、citable=0）。
+   */
+  ocr_jp: EvidenceItem[];
   jp_snapshot: SnapshotLine[];
   en_snapshot: SnapshotLine[];
   jp_window: { from: string; to: string } | null;
@@ -377,6 +383,40 @@ export async function gatherEvidence(
   if (!material_jp.length) material_jp = await pickItems(0, 'jp', 30, 24);
   let material_en = await pickItems(0, 'en', materialDays, 12);
   if (!material_en.length) material_en = await pickItems(0, 'en', 30, 12);
+
+  // ---- 画像内テキストのOCR結果（仕様§9-3）----
+  // 日本の公式Xは開催日時・応募締切・対象レベルを画像に載せるため、
+  // ポスト本文だけでは「明日以降の予定」を書けない。OCR結果を材料に加える。
+  // citable は元ソースの is_official を継承する（公式画像＝公式1次情報）。
+  const pickOcr = async (days: number, limit: number): Promise<EvidenceItem[]> => {
+    const sql = `SELECT o.ocr_text, o.observed_at, o.page_url,
+                        COALESCE(s.label, o.source_key) AS source,
+                        s.is_official, s.trust
+                   FROM meta_ocr o
+                   LEFT JOIN meta_sources s ON s.key = o.source_key
+                  WHERE o.status = 'ok' AND o.char_count > 0
+                    AND (s.region IS NULL OR s.region = 'jp')
+                    AND (o.observed_at IS NULL OR o.observed_at >= date(?, ?))
+                  ORDER BY COALESCE(o.observed_at, o.created_at) DESC
+                  LIMIT ?`;
+    try {
+      const rows = await db.prepare(sql).bind(today, `-${days} days`, limit).all();
+      return ((rows.results ?? []) as any[]).map((r) => ({
+        title: '画像内テキスト',
+        excerpt: clip(r.ocr_text, 700),
+        observed_at: String(r.observed_at ?? ''),
+        citable: (Number(r.is_official) ? 1 : 0) as 0 | 1,
+        // 公式画像なら元ポストURLを引用リンクに使える。非公式はURLを渡さない
+        url: Number(r.is_official) ? String(r.page_url ?? '') : '',
+        source: Number(r.is_official) ? String(r.source ?? '') : '',
+        trust: Number(r.trust ?? 3),
+      }));
+    } catch {
+      return [];
+    }
+  };
+  let ocr_jp = await pickOcr(officialDays, 14);
+  if (!ocr_jp.length) ocr_jp = await pickOcr(45, 14);
 
   // ---- メタ集計スナップショット（最新の window_to のもの）----
   const snapshot = async (region: 'jp' | 'en') => {
@@ -542,6 +582,7 @@ export async function gatherEvidence(
     official_en,
     material_jp,
     material_en,
+    ocr_jp,
     jp_snapshot: jpSnap.rows,
     en_snapshot: enSnap.rows,
     jp_window: jpSnap.window,
@@ -748,6 +789,30 @@ export function buildReportPrompt(ev: Evidence): string {
       fmtItems(ev.material_en, false)
   );
 
+  // 画像内テキスト（仕様§9-3）。
+  // 公式の告知画像には本文にない開催時刻・対象レベル・応募締切が入っている。
+  // ただしOCRは誤認識し得るので、公式本文と知している情報が衍突する場合は本文を優先するよう指示する。
+  if (ev.ocr_jp.length) {
+    const citable = ev.ocr_jp.filter((o) => o.citable === 1);
+    const nonCitable = ev.ocr_jp.filter((o) => o.citable === 0);
+    if (citable.length) {
+      parts.push(
+        `# 材料D2: 公式画像の画像内テキスト（OCR）` +
+          `【公式1次情報なのでURLをリンクとして使ってよい。` +
+          `ただしOCRは誤認識し得るので、材料Aの本文と食い違う場合は材料Aを優先。` +
+          `読み取れていない数値を推測で補わない】\n` +
+          fmtItems(citable, true)
+      );
+    }
+    if (nonCitable.length) {
+      parts.push(
+        `# 材料D3: 非公式画像の画像内テキスト（OCR）` +
+          `【材料としてのみ。ソース名・URL・アカウント名は書かない。集約表現にする】\n` +
+          fmtItems(nonCitable, false)
+      );
+    }
+  }
+
   parts.push(`# 材料E: 日本のメタ集計（この数値をそのまま使う）\n${fmtSnap(ev.jp_snapshot, ev.jp_window)}`);
   parts.push(`# 材料F: 海外のメタ集計（この数値をそのまま使う）\n${fmtSnap(ev.en_snapshot, ev.en_window)}`);
 
@@ -945,6 +1010,7 @@ export async function generateReport(
     jp_decks: ev.jp_decks.length,
     en_decks: ev.en_decks.length,
     spotlight: ev.spotlight.length,
+    ocr_jp: ev.ocr_jp.length,
   };
 
   const totalMaterial =

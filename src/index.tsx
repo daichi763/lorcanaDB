@@ -798,17 +798,20 @@ const ADMIN_HTML = `<!DOCTYPE html>
         <button id="op-btn-meta-collect" class="bg-sky-700 hover:bg-sky-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
           <i class="fas fa-satellite-dish mr-1"></i>① 情報を収集
         </button>
+        <button id="op-btn-meta-ocr" class="bg-sky-800 hover:bg-sky-700 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
+          <i class="fas fa-image mr-1"></i>② 画像の文字を読取
+        </button>
         <button id="op-btn-meta-aggregate" class="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
-          <i class="fas fa-calculator mr-1"></i>② 集計
+          <i class="fas fa-calculator mr-1"></i>③ 集計
         </button>
         <button id="op-btn-meta-summarize" class="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
-          <i class="fas fa-pen-nib mr-1"></i>③ 要約を生成
+          <i class="fas fa-pen-nib mr-1"></i>④ 要約を生成
         </button>
         <button id="op-btn-meta-memory" class="bg-indigo-700 hover:bg-indigo-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
-          <i class="fas fa-brain mr-1"></i>④ 記憶層へ反映
+          <i class="fas fa-brain mr-1"></i>⑤ 記憶層へ反映
         </button>
         <button id="op-btn-meta-all" class="bg-amber-700 hover:bg-amber-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm font-medium transition">
-          <i class="fas fa-forward-fast mr-1"></i>①〜④を続けて実行
+          <i class="fas fa-forward-fast mr-1"></i>①〜⑤を続けて実行
         </button>
       </div>
 
@@ -816,7 +819,8 @@ const ADMIN_HTML = `<!DOCTYPE html>
 
       <p class="text-[11px] text-slate-500 leading-relaxed">
         ①は1回のリクエストで1ソースずつ進みます（公式サーバへの礼儀のため間隔を空けます）。完了まで自動で繰り返します。<br />
-        ③が失敗した場合、既存のレポートは書き換えず<strong class="text-slate-400">前日分の表示を維持</strong>します。<br />
+        ②は公式告知画像の文字（開催時刻・会場・対象レベルなど本文に書かれない情報）を読み取ります。1枚ずつ処理し、同じ画像は二度読みません。<br />
+        ④が失敗した場合、既存のレポートは書き換えず<strong class="text-slate-400">前日分の表示を維持</strong>します。<br />
         X（旧Twitter）と TopDeck.gg はAPIキーが必要です。未設定のソースは「スキップ」として成功扱いになります。
       </p>
     </div>
