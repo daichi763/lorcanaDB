@@ -232,6 +232,26 @@ console.log('\n[6] フロント側スクリプトの静的検査');
   ok(/jp_only=1/.test(pr), 'デッキレシピタブは playable_jp=1 のみ取得する');
   ok(/rel="noopener noreferrer nofollow"/.test(pr), 'レシピ出典リンクに nofollow を付ける');
 
+  /*
+   * カード詳細は /cards/:key（複数形）。かつて /card/（単数形）を指していて
+   * クリックすると 404 になっていた。リンク綴りの間違いは画面上ふつうに
+   * 見えてしまい、実際に踏むまで気付けないので綴りを固定して監視する。
+   */
+  ok(/href="\/cards\//.test(pr), 'レシピのカード名リンクが /cards/ を指す');
+  for (const f of ['page-recipes.js', 'page-deck.js', 'page-meta.js', 'page-card.js', 'page-search.js', 'page-synergy.js']) {
+    const src = readFileSync(`public/static/${f}`, 'utf8');
+    ok(!/["'`]\/card\//.test(src), `${f} に単数形 /card/ のリンクが無い`);
+  }
+
+  // ホバープレビュー（クリックせずにカード内容を読める）
+  ok(/js-card-peek/.test(pr), 'カード名リンクにホバー用の目印がある');
+  ok(/data-file="/.test(pr), 'ホバー時に引くカードを data-file で持つ');
+  ok(/id\s*=\s*'card-peek'/.test(pr), 'プレビュー枠 #card-peek を作る');
+  ok(/peekCache/.test(pr), '取得結果をキャッシュして再取得を避ける');
+  ok(/hover: hover/.test(pr), 'タッチ環境ではホバーを出さない');
+  ok(/inkwell[^\n]*toLowerCase\(\)\s*===\s*'y'/.test(pr), "inkwell は 'y' との文字列比較で判定する");
+  ok(/closest\('li'\)/.test(pr), 'ポップアップ位置はリンクではなく行を基準にする');
+
   // 分割後にレシピ処理が両ファイルへ二重化していないこと（片方だけ直す事故を防ぐ）
   const pd = readFileSync('public/static/page-deck.js', 'utf8');
   ok(!/meta-recipes-list/.test(pd), 'page-deck.js にレシピ描画が残っていない');

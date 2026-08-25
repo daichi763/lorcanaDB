@@ -51,11 +51,241 @@ window.initRecipesPage = function () {
       `<li class="flex items-center gap-2 py-1">` +
       `<span class="w-6 text-right font-mono text-xs text-amber-300 shrink-0">${c.qty}</span>` +
       img +
-      `<a href="/card/${encodeURIComponent(c.card_file || '')}"` +
-      ` class="text-xs text-slate-200 hover:text-amber-300 leading-tight flex-1 min-w-0 truncate">` +
+      // カード詳細は /cards/:key。かつて /card/（単数形）を指していて 404 になっていた
+      `<a href="/cards/${encodeURIComponent(c.card_file || '')}"` +
+      ` class="js-card-peek text-xs text-slate-200 hover:text-amber-300 leading-tight flex-1 min-w-0 truncate"` +
+      ` data-file="${esc(c.card_file || '')}">` +
       `${esc(c.name || c.card_name)}</a>` + cost +
       `</li>`
     );
+  }
+
+  // ---------- ホバーでカードデータをプレビュー ----------
+  /*
+   * レシピは1件あたり十数種のカードが並ぶ。1枚ずつ詳細ページへ遷移して
+   * 戻ると構築全体を見比べられないため、その場で内容を確認できるようにする。
+   *
+   * 実装上の注意:
+   *  - 取得結果は file 単位でキャッシュする。同じカードは4枚並ぶうえ、
+   *    行を往復するたびに再取得すると無駄な通信になる
+   *  - 開くまで少し待つ（HOVER_DELAY）。一覧を素早く横切っただけで
+   *    次々ポップアップが出るとかえって読みにくい
+   *  - タッチ環境ではホバーが無いので出さない。リンク遷移（詳細ページ）に任せる
+   *  - 表示位置は画面内に収める。端のカードで枠外に出ると読めない
+   */
+  const peekCache = new Map();
+  const HOVER_DELAY = 220;
+  let peekEl = null;
+  let peekTimer = null;
+  let peekToken = 0;
+
+  const canHover = window.matchMedia
+    ? window.matchMedia('(hover: hover) and (pointer: fine)').matches
+    : true;
+
+  function peekBox() {
+    if (peekEl) return peekEl;
+    peekEl = document.createElement('div');
+    peekEl.id = 'card-peek';
+    peekEl.setAttribute('role', 'tooltip');
+    peekEl.className =
+      'hidden fixed z-50 w-[300px] max-w-[92vw] p-2.5 rounded-lg bg-slate-900 ' +
+      'border border-slate-600 shadow-2xl shadow-black/60 text-slate-100 pointer-events-none';
+    /*
+     * 位置計算は枠の実寸に依存する。Tailwind の CDN 版はクラスを実行時に生成
+     * するため、最初のホバーでは w-[300px] などがまだ効いておらず、幅を
+     * 測り損ねて置き場所を誤る（左上に寄る）。寸法に関わる指定だけは
+     * インラインでも持たせて、いつ測っても同じ答えになるようにする。
+     */
+    peekEl.style.position = 'fixed';
+    peekEl.style.width = '300px';
+    peekEl.style.maxWidth = '92vw';
+    peekEl.style.boxSizing = 'border-box';
+    document.body.appendChild(peekEl);
+    return peekEl;
+  }
+
+  function statChip(icon, val, label) {
+    if (val == null || val === '') return '';
+    return (
+      `<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-slate-800 ` +
+      `border border-slate-700 text-[10px]" title="${esc(label)}">` +
+      `<i class="fas fa-${icon} text-slate-400"></i>${esc(String(val))}</span>`
+    );
+  }
+
+  function peekHtml(c) {
+    const title = c.card_group || c.card_name || '';
+    const inks = [c.ink_color, c.ink_color2].filter(Boolean).join(' / ');
+    const cls = (c.classifications || []).slice(0, 4).join('・');
+    // ルビ等を除いた本文。長いものは切って、続きは詳細ページで読ませる
+    const rules = String(c.rules_text_plain || c.rules_text || '').trim();
+    const body = rules
+      ? `<p class="mt-1.5 text-[11px] leading-relaxed text-slate-300 whitespace-pre-wrap">${esc(
+          rules.length > 260 ? rules.slice(0, 260) + '…' : rules
+        )}</p>`
+      : '<p class="mt-1.5 text-[11px] text-slate-500">（効果テキストなし）</p>';
+    const img = c.image_url
+      ? `<img src="${esc(c.image_url)}" alt="" loading="lazy" decoding="async"` +
+        ` referrerpolicy="no-referrer-when-downgrade"` +
+        ` class="w-[74px] h-[103px] object-cover rounded shrink-0 bg-slate-800">`
+      : '';
+    return (
+      `<div class="flex gap-2.5">` +
+      img +
+      `<div class="min-w-0 flex-1">` +
+      `<p class="text-[13px] font-bold leading-tight">${esc(title)}</p>` +
+      `<p class="mt-0.5 text-[10px] text-slate-400">` +
+      [c.card_type, inks, c.rarity].filter(Boolean).map(esc).join(' ・ ') +
+      `</p>` +
+      `<div class="mt-1.5 flex flex-wrap gap-1">` +
+      statChip('droplet', c.ink_cost, 'インクコスト') +
+      statChip('hand-fist', c.strength, '攻撃力') +
+      statChip('shield-halved', c.willpower, '耐久力') +
+      statChip('star', c.lore_value, 'ロア値') +
+      // inkwell は真偽値ではなく 'y'/'n' 等の文字列で来る。truthy 判定だと 'n' も通る
+      (String(c.inkwell ?? '').toLowerCase() === 'y'
+        ? statChip('circle-check', 'インク可', 'インクにできる')
+        : '') +
+      `</div>` +
+      (cls ? `<p class="mt-1 text-[10px] text-slate-400">${esc(cls)}</p>` : '') +
+      `</div></div>` +
+      body +
+      `<p class="mt-1.5 pt-1.5 border-t border-slate-800 text-[10px] text-sky-400">` +
+      `クリックでカード詳細を開く</p>`
+    );
+  }
+
+  /**
+   * リンクの近くに、画面からはみ出さない位置で開く。
+   *
+   * 位置決めで一番大事なのは「今どのカードを見ているのか分かること」なので、
+   * ホバー中の行に被せない置き方を優先する。行の左右に余地があれば横へ、
+   * 無ければ行の下（入らなければ上）へ逃がし、最後の手段としてだけ
+   * 画面内に収める都合で重なりを許す。
+   * 基準は <a> ではなく行（li）にする。<a> は flex-1 で横に長く、
+   * その右端を基準にすると必ず左へ折り返して行を覆ってしまう。
+   */
+  function placePeek(box, anchor) {
+    const row = anchor.closest('li') || anchor;
+    const r = row.getBoundingClientRect();
+    box.classList.remove('hidden');
+    box.style.display = 'block';
+    const bw = box.offsetWidth;
+    const bh = box.offsetHeight;
+    const M = 8;
+    const GAP = 10;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    const clampTop = (t) => Math.max(M, Math.min(t, vh - bh - M));
+    const clampLeft = (l) => Math.max(M, Math.min(l, vw - bw - M));
+
+    let left;
+    let top;
+    if (r.right + GAP + bw <= vw - M) {
+      // 行の右側（余白が広い側を優先）
+      left = r.right + GAP;
+      top = clampTop(r.top - 6);
+    } else if (r.left - GAP - bw >= M) {
+      // 行の左側
+      left = r.left - GAP - bw;
+      top = clampTop(r.top - 6);
+    } else if (r.bottom + GAP + bh <= vh - M) {
+      // 横に置けないので行の直下
+      left = clampLeft(r.left);
+      top = r.bottom + GAP;
+    } else if (r.top - GAP - bh >= M) {
+      // 直下も無理なら行の直上
+      left = clampLeft(r.left);
+      top = r.top - GAP - bh;
+    } else {
+      // どこにも逃げ場が無い（狭い画面）。読めることを優先して画面内に収める
+      left = clampLeft(r.left);
+      top = clampTop(r.top - 6);
+    }
+    box.style.left = `${Math.round(left)}px`;
+    box.style.top = `${Math.round(top)}px`;
+  }
+
+  function hidePeek() {
+    clearTimeout(peekTimer);
+    peekToken++;
+    if (!peekEl) return;
+    // class（hidden）とインライン display の両方を合わせる。片方だけだと
+    // 寸法確定用に入れたインライン指定が hidden を打ち消して出たままになる
+    peekEl.classList.add('hidden');
+    peekEl.style.display = 'none';
+  }
+
+  async function showPeek(a) {
+    const file = a.dataset.file;
+    if (!file) return;
+    const my = ++peekToken;
+
+    let card = peekCache.get(file);
+    if (!card) {
+      try {
+        const d = await apiGet(`/api/cards/${encodeURIComponent(file)}`);
+        card = d.card || d;
+        peekCache.set(file, card);
+      } catch {
+        return; // 取得できなければ何も出さない（リンク遷移は生きている）
+      }
+    }
+    // 取得中にマウスが離れた／別のカードへ移った場合は描画しない
+    if (my !== peekToken || !a.isConnected) return;
+
+    const box = peekBox();
+    box.innerHTML = peekHtml(card);
+    placePeek(box, a);
+
+    /*
+     * 位置は「置いた瞬間の寸法」で決まるが、その時点ではまだ
+     *  - Tailwind の CDN 版がクラスを生成し終えていない（枠幅や列組みが未確定）
+     *  - ポップアップ内のカード画像が読み込まれていない（枠の高さが未確定）
+     * ことがあり、確定後の寸法とずれて行に被る位置に残ってしまう。
+     * 描画が落ち着いてからもう一度置き直す。
+     */
+    const again = () => {
+      if (my !== peekToken || !a.isConnected) return;
+      placePeek(box, a);
+    };
+    requestAnimationFrame(() => requestAnimationFrame(again));
+    const im = box.querySelector('img');
+    if (im && !im.complete) {
+      im.addEventListener('load', again, { once: true });
+      im.addEventListener('error', again, { once: true });
+    }
+  }
+
+  function initCardPeek() {
+    if (!canHover) return;
+    const root = $('#meta-recipes');
+    if (!root) return;
+
+    // 行は動的に描き替わるので、個別ではなく親で受ける（委譲）
+    root.addEventListener('mouseover', (ev) => {
+      const a = ev.target.closest('.js-card-peek');
+      if (!a) return;
+      clearTimeout(peekTimer);
+      peekTimer = setTimeout(() => showPeek(a), HOVER_DELAY);
+    });
+    root.addEventListener('mouseout', (ev) => {
+      if (ev.target.closest('.js-card-peek')) hidePeek();
+    });
+    // キーボード操作でも内容を読めるようにする
+    root.addEventListener('focusin', (ev) => {
+      const a = ev.target.closest('.js-card-peek');
+      if (a) showPeek(a);
+    });
+    root.addEventListener('focusout', (ev) => {
+      if (ev.target.closest('.js-card-peek')) hidePeek();
+    });
+    // 開いたまま置き去りにならないように
+    window.addEventListener('scroll', hidePeek, { passive: true });
+    document.addEventListener('click', hidePeek);
+    document.addEventListener('keydown', (ev) => { if (ev.key === 'Escape') hidePeek(); });
   }
 
   async function showRecipeDetail(id) {
@@ -262,4 +492,5 @@ window.initRecipesPage = function () {
 
   // ---------- 起動 ----------
   initRecipes();
+  initCardPeek();
 };
