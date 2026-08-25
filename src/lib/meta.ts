@@ -702,7 +702,7 @@ export async function importEnRecap(db: D1Database, a: EnArticle): Promise<{ dec
   for (let gi = 0; gi < groups.length; gi++) {
     const g = groups[gi];
     const total = g.lines.reduce((s, l) => s + l.qty, 0);
-    if (total !== 60) continue; // 60枚でないものは信頼できないので捨てる
+    if (total < 60) continue; // 60枚未満はルール上ありえないのでパース失敗と判断
 
     const { placement, inks } = guessPlacement(g.heading);
     const deckKey = `en:${a.slug}:${gi}`;
@@ -996,8 +996,8 @@ export async function collectJpDecksBySeason(
       rejected.push({
         url,
         reason:
-          res.reason === 'not_60'
-            ? `出典データが${res.counted}枚（60枚ではない）`
+          res.reason === 'under_60'
+            ? `出典データが${res.counted}枚（60枚未満はルール上ありえない）`
             : 'デッキ表が見つからない',
       });
     }
@@ -1069,7 +1069,7 @@ export async function importJpDeck(
   html: string,
   index: CardIndex,
   lastmod: string | null
-): Promise<{ ok: boolean; reason?: 'no_table' | 'not_60'; counted?: number }> {
+): Promise<{ ok: boolean; reason?: 'no_table' | 'under_60'; counted?: number }> {
   const pick = (re: RegExp) => html.match(re);
   const season = pick(/href="https:\/\/disneylorcana\.jp\/deck\/season\/([^"/]+)\/">([^<]+)</);
   const event = pick(/href="https:\/\/disneylorcana\.jp\/deck\/event-tournament\/([^"/]+)\/">([^<]+)</);
@@ -1102,8 +1102,12 @@ export async function importJpDeck(
   }
 
   const total = lines.reduce((s, l) => s + l.qty, 0);
-  // 60枚に満たない/超えるものは取り込まない（デッキ構築の規定枚数）
-  if (total !== 60) return { ok: false, reason: 'not_60', counted: total };
+  /*
+   * ロルカナのルールでは 60 枚は「下限」であり上限は無い。
+   * したがって 61 枚以上のデッキは正当に存在し、取り込むべきである。
+   * 60 枚未満だけがルール上ありえないので、パース失敗として扱う。
+   */
+  if (total < 60) return { ok: false, reason: 'under_60', counted: total };
 
   const deckKey = `jp:${deckIdFromUrl(url)}`;
   const missing: string[] = [];
@@ -1278,6 +1282,244 @@ function guessJpPlacement(html: string): string | null {
   if (/TOP\s*4|ベスト4|上位4/i.test(t)) return 'TOP4';
   if (/TOP\s*8|ベスト8|上位8/i.test(t)) return 'TOP8';
   return null;
+}
+
+// ============================ 収集: X / note のデッキ共有リンク ============================
+
+/*
+ * 公式デッキビルダーの共有コードの復号表。
+ * 出典: takaratomy.co.jp .../common/components/js/env.js の map / padds。
+ * 復号アルゴリズムも同サイトの useDeck.js の decode() と同一にしてある。
+ */
+const DB_CODE_MAP = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567=';
+const DB_CODE_PADDS = ['1', '8', '9', '0'];
+
+/**
+ * 公式デッキビルダーの共有コード1個を復号する。
+ *
+ * 復号結果は9桁の数字列で、`枚数*10`(3桁) + `カード番号`(3桁) + `弾番号`(3桁)。
+ * 実測: サファイア/スティールの共有リンク17種を復号し、合計65枚・
+ * 同一カードの重複なしで整合した（カード名もすべて日本語DBに実在）。
+ */
+export function decodeDeckShareCode(code: string): { qty: number; num: number; set: number } | null {
+  let txt = String(code ?? '');
+  for (const p of DB_CODE_PADDS) txt = txt.split(p).join('');
+  let ret = '';
+  for (let j = 0; j < txt.length; j += 2) {
+    const n1 = DB_CODE_MAP.indexOf(txt.substring(j, j + 1));
+    const n2 = DB_CODE_MAP.indexOf(txt.substring(j + 1, j + 2));
+    if (n1 < 0 || n2 < 0) return null;
+    if (n1 === 0) {
+      const t = String(n2);
+      ret = (t.length === 1 ? `00${t}` : `0${t}`) + ret;
+    } else {
+      ret = String(n1 * 32 + n2) + ret;
+    }
+    if (ret.length % 3 === 1) ret = `00${ret}`;
+    else if (ret.length % 3 === 2) ret = `0${ret}`;
+  }
+  if (ret.length !== 9) return null;
+  const qty = Number(ret.slice(0, 3)) / 10;
+  const num = Number(ret.slice(3, 6));
+  const set = Number(ret.slice(6, 9));
+  // 枚数は整数でなければ復号の解釈ミス。黙って通すと嘘のデッキができる
+  if (!Number.isInteger(qty) || qty < 1 || qty > 60) return null;
+  if (!num || !set) return null;
+  return { qty, num, set };
+}
+
+/** 記事HTMLから公式デッキビルダーの共有リンク（cs/ds）を全部取り出す */
+export function extractDeckShareLinks(html: string): Array<{ inks: string[]; codes: string[] }> {
+  const out: Array<{ inks: string[]; codes: string[] }> = [];
+  const seen = new Set<string>();
+  const re = /deckbuilder\/deck\/\?([^"'\s<>\\]+)/g;
+  for (const m of html.matchAll(re)) {
+    // HTMLエンティティの &amp; を戻してからクエリとして解く
+    const qs = m[1].replace(/&amp;/g, '&');
+    let params: URLSearchParams;
+    try { params = new URLSearchParams(qs); } catch { continue; }
+    const ds = params.get('ds');
+    if (!ds) continue;
+    const codes = ds.split(',').map((x) => x.trim()).filter(Boolean);
+    if (codes.length < 8) continue; // デッキとして成立しない断片は捨てる
+    const key = codes.join('|');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const inks = (params.get('cs') ?? '').split(',').map((x) => x.trim()).filter(Boolean);
+    out.push({ inks, codes });
+  }
+  return out;
+}
+
+/**
+ * X / note の記事から、公式デッキビルダーの共有リンクを見つけてデッキとして取り込む。
+ *
+ * 【なぜこの方法にしたか】
+ * note や X の本文にはデッキ表がテキストで載っていないことが多く（実測: note
+ * のデッキタグ記事10本すべてでカード行を1件も抽出できなかった）、画像のOCRでは
+ * 枚数の正確性を担保できない。一方で記事には公式デッキビルダーの共有リンクが
+ * 貼られており、これは公式のエンコードなので確実にデッキ構成を復元できる。
+ *
+ * 【§1.3への配慮】
+ * ・本文は一切保存しない。取り出すのは共有リンクに入ったカード構成だけ
+ * ・出典URLはデッキレシピの例外規定として記録・表示する（source_url）
+ * ・出典名は記事タイトルではなく媒体名（note / X）に留め、投稿者名は出さない
+ */
+export async function collectSocialDecks(
+  db: D1Database,
+  opts: { sourceKeys?: string[]; maxArticles?: number; season?: string } = {}
+): Promise<{ scanned: number; found: number; imported: number; skipped: number; remaining: number;
+            rejected: Array<{ url: string; reason: string }> }> {
+  const maxArticles = Math.min(12, Math.max(1, opts.maxArticles ?? 6));
+  const keys = opts.sourceKeys ?? [
+    'note_lorcana_deck', 'note_lorcana', 'note_disney_lorcana',
+    'x_official_jp', 'jp_community_post',
+  ];
+  const ph = keys.map(() => '?').join(',');
+  const q = await db
+    .prepare(
+      `SELECT url, source_key, observed_at FROM meta_raw_items
+        WHERE source_key IN (${ph}) ORDER BY observed_at DESC LIMIT 200`
+    )
+    .bind(...keys)
+    .all();
+  const items = ((q.results ?? []) as any[]).map((r) => ({
+    url: String(r.url), sourceKey: String(r.source_key), observed: r.observed_at ? dateOnly(String(r.observed_at)) : null,
+  }));
+
+  // 取り込み済み・恒久除外を除く
+  const known = new Set<string>();
+  {
+    const r = await db.prepare("SELECT deck_key FROM meta_decks WHERE deck_key LIKE 'social:%'").all();
+    for (const row of (r.results ?? []) as any[]) known.add(String(row.deck_key));
+  }
+  const skip = new Set<string>();
+  {
+    const r = await db
+      .prepare("SELECT url FROM meta_deck_skips WHERE attempts >= 2 AND source_key LIKE 'social%'")
+      .all()
+      .catch(() => ({ results: [] as any[] }));
+    for (const row of (r.results ?? []) as any[]) skip.add(String(row.url));
+  }
+
+  const index = await buildCardIndex(db);
+  const pending = items.filter((it) => !skip.has(it.url));
+  const batch = pending.slice(0, maxArticles);
+
+  let found = 0; let imported = 0; let skipped = 0;
+  const rejected: Array<{ url: string; reason: string }> = [];
+
+  for (const it of batch) {
+    await politeSleep();
+    const r = await politeFetch(it.url);
+    if (r.status !== 200) {
+      skipped++;
+      await noteDeckSkip(db, it.url, 'social', 'http_error');
+      rejected.push({ url: it.url, reason: `取得できない（HTTP ${r.status}）` });
+      continue;
+    }
+    const links = extractDeckShareLinks(r.text);
+    if (!links.length) {
+      skipped++;
+      await noteDeckSkip(db, it.url, 'social', 'no_table');
+      rejected.push({ url: it.url, reason: 'デッキ共有リンクが無い' });
+      continue;
+    }
+    const label = /note\.com/.test(it.url) ? 'note（プレイヤー投稿）' : 'X（プレイヤー投稿）';
+    for (let i = 0; i < links.length; i++) {
+      found++;
+      const deckKey = `social:${await sha256Hex(links[i].codes.join(','))}`.slice(0, 48);
+      if (known.has(deckKey)) continue;
+      const res = await importShareDeck(db, {
+        deckKey, url: it.url, label, observed: it.observed,
+        inks: links[i].inks, codes: links[i].codes, season: opts.season ?? null, index,
+      });
+      if (res.ok) { imported++; known.add(deckKey); }
+      else {
+        skipped++;
+        rejected.push({ url: it.url, reason: res.reason === 'under_60'
+          ? `復号結果が${res.counted}枚（60枚未満）` : 'カードを特定できない' });
+      }
+    }
+  }
+
+  return { scanned: batch.length, found, imported, skipped,
+           remaining: Math.max(0, pending.length - batch.length), rejected };
+}
+
+/** 共有コード群を1デッキとして meta_decks / meta_deck_cards に書き込む */
+async function importShareDeck(
+  db: D1Database,
+  a: { deckKey: string; url: string; label: string; observed: string | null; inks: string[];
+       codes: string[]; season: string | null; index: CardIndex }
+): Promise<{ ok: boolean; reason?: 'under_60' | 'no_cards'; counted?: number }> {
+  const cards: Array<{ card_id: number | null; card_name: string; raw: string; qty: number }> = [];
+  const missing: string[] = [];
+  let total = 0;
+  for (const code of a.codes) {
+    const d = decodeDeckShareCode(code);
+    if (!d) continue;
+    total += d.qty;
+    const like = `${String(d.num).padStart(3, '0')}_DLCS${d.set}\\_%`;
+    const row = await db
+      .prepare("SELECT id, card_name, version FROM cards WHERE card_file LIKE ? ESCAPE '\\' LIMIT 1")
+      .bind(like)
+      .first<{ id: number; card_name: string; version: string | null }>();
+    if (row?.id) {
+      const nm = row.version ? `${row.card_name} – ${row.version}` : String(row.card_name);
+      cards.push({ card_id: Number(row.id), card_name: nm, raw: code, qty: d.qty });
+    } else {
+      const nm = `未特定カード（${d.set}弾 ${String(d.num).padStart(3, '0')}）`;
+      missing.push(nm);
+      cards.push({ card_id: null, card_name: nm, raw: code, qty: d.qty });
+    }
+  }
+  if (!cards.length) return { ok: false, reason: 'no_cards' };
+  // 60枚は下限。下回るものは復号ミスか記事側の部分掲載なので採らない
+  if (total < 60) return { ok: false, reason: 'under_60', counted: total };
+
+  const matched = cards.filter((c) => c.card_id).length;
+  const playable = matched / cards.length >= 0.9 ? 1 : 0;
+
+  await db
+    .prepare(
+      `INSERT INTO meta_decks
+         (deck_key,name,archetype,region,ink1,ink2,player,placement,weight,event_name,season,
+          total_cards,playable_jp,missing_cards,source_key,source_url,source_label,observed_at,fetched_at,updated_at)
+       VALUES (?,?,NULL,'jp',?,?,NULL,NULL,1,NULL,?,?,?,?,'social_deck',?,?,?,datetime('now'),datetime('now'))
+       ON CONFLICT(deck_key) DO UPDATE SET
+         ink1=excluded.ink1, ink2=excluded.ink2, season=excluded.season,
+         total_cards=excluded.total_cards, playable_jp=excluded.playable_jp,
+         missing_cards=excluded.missing_cards, updated_at=datetime('now')`
+    )
+    .bind(
+      a.deckKey,
+      a.inks.length ? a.inks.join('/') : 'プレイヤー投稿デッキ',
+      a.inks[0] ?? null, a.inks[1] ?? null,
+      a.season, total, playable,
+      missing.length ? JSON.stringify(missing.slice(0, 40)) : null,
+      a.url, a.label, a.observed
+    )
+    .run();
+
+  const deck = await db.prepare('SELECT id FROM meta_decks WHERE deck_key = ?').bind(a.deckKey).first<{ id: number }>();
+  const deckId = Number(deck?.id ?? 0);
+  if (!deckId) return { ok: false, reason: 'no_cards' };
+
+  const stmts: D1PreparedStatement[] = [
+    db.prepare('DELETE FROM meta_deck_cards WHERE deck_id = ?').bind(deckId),
+  ];
+  for (const cd of cards) {
+    stmts.push(
+      db.prepare(
+        `INSERT INTO meta_deck_cards (deck_id,card_id,card_name,raw_name,qty)
+           VALUES (?,?,?,?,?)
+         ON CONFLICT(deck_id,card_name) DO UPDATE SET qty=excluded.qty, card_id=excluded.card_id`
+      ).bind(deckId, cd.card_id, cd.card_name, cd.raw, cd.qty)
+    );
+  }
+  await runBatched(db, stmts);
+  return { ok: true, counted: total };
 }
 
 // ============================ 収集: note RSS ============================

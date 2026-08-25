@@ -42,6 +42,7 @@ import {
   closeJob,
   collectJpDecksBySeason,
   rematchDeckCards,
+  collectSocialDecks,
   collectOne,
   computeSnapshots,
   extractJpEvents,
@@ -619,6 +620,24 @@ admin.post('/meta/decks/rematch', async (c) => {
   const season = String(body?.season ?? '').trim() || undefined;
   const out = await rematchDeckCards(c.env.DB, { season });
   return c.json({ season: season ?? null, ...out });
+});
+
+/**
+ * X / note の記事から公式デッキビルダーの共有リンクを見つけてデッキ化する。
+ * 本文は保存せず、共有リンクに入ったカード構成だけを取り出す（仕様§1.3）。
+ */
+admin.post('/meta/decks/social', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const out = await collectSocialDecks(c.env.DB, {
+    maxArticles: Number(body?.max) || 6,
+    season: body?.season ? String(body.season) : undefined,
+    sourceKeys: Array.isArray(body?.sourceKeys) && body.sourceKeys.length
+      ? body.sourceKeys.map((x: unknown) => String(x))
+      : undefined,
+  });
+  return c.json({ done: out.remaining === 0, ...out });
 });
 
 /**

@@ -3,7 +3,7 @@
  *
  *  - ドラッグ&ドロップでデッキ構築（1枚あたり最大4枚、limit_card があればそれに従う）
  *  - インクカラー2色ルール検証（ink_color + ink_color2 を許容、デッキ全体で2色以内）
- *  - 合計 60 枚のバリデーション
+ *  - 合計 60 枚以上のバリデーション（60枚は下限。上限は無い）
  *  - コスト曲線・種族分布・インク配分の可視化
  *  - 公式デッキコードの取り込み（サーバ側プロキシ経由）
  *  - 逆方向（自デッキ→コード）は公式の 1日30回制限があるため実装せず、
@@ -73,10 +73,15 @@ window.initDeckPage = function () {
     const total = totalCards();
     const inks = deckInkColors();
 
-    if (total !== A.DECK_SIZE) {
+    /*
+     * ロルカナのルールでは 60 枚は「下限」で、上限は無い。
+     * 61 枚以上のデッキは正当に存在するため、超過をエラーにしてはいけない。
+     * 60 枚未満だけがルール違反。
+     */
+    if (total < A.DECK_SIZE) {
       issues.push({
-        level: total > A.DECK_SIZE ? 'error' : 'warn',
-        msg: `デッキは ${A.DECK_SIZE} 枚必要です（現在 ${total} 枚 / ${total > A.DECK_SIZE ? `${total - A.DECK_SIZE} 枚超過` : `あと ${A.DECK_SIZE - total} 枚`}）`,
+        level: 'error',
+        msg: `デッキは ${A.DECK_SIZE} 枚以上必要です（現在 ${total} 枚 / あと ${A.DECK_SIZE - total} 枚）`,
       });
     }
     if (inks.length > A.MAX_INK_COLORS) {
@@ -94,7 +99,7 @@ window.initDeckPage = function () {
         });
       }
     }
-    return { issues, total, inks, valid: issues.filter((i) => i.level === 'error').length === 0 && total === A.DECK_SIZE };
+    return { issues, total, inks, valid: issues.filter((i) => i.level === 'error').length === 0 && total >= A.DECK_SIZE };
   }
 
   // ---------- 描画: サマリ・検証 ----------
@@ -111,12 +116,12 @@ window.initDeckPage = function () {
          <span class="text-sm font-bold">
            <i class="fas fa-layer-group text-amber-300 mr-1"></i>デッキ
          </span>
-         <span class="text-lg font-bold ${v.total === A.DECK_SIZE ? 'text-emerald-400' : v.total > A.DECK_SIZE ? 'text-rose-400' : 'text-slate-300'}">
-           ${v.total}<span class="text-xs text-slate-500">/${A.DECK_SIZE}</span>
+         <span class="text-lg font-bold ${v.total >= A.DECK_SIZE ? 'text-emerald-400' : 'text-slate-300'}">
+           ${v.total}<span class="text-xs text-slate-500">/${A.DECK_SIZE}以上</span>
          </span>
        </div>
        <div class="h-1.5 bg-slate-800 rounded-full overflow-hidden">
-         <div class="h-full ${v.total > A.DECK_SIZE ? 'bg-rose-500' : v.total === A.DECK_SIZE ? 'bg-emerald-500' : 'bg-sky-500'} transition-all"
+         <div class="h-full ${v.total >= A.DECK_SIZE ? 'bg-emerald-500' : 'bg-sky-500'} transition-all"
               style="width:${Math.min((v.total / A.DECK_SIZE) * 100, 100)}%"></div>
        </div>
        ${v.inks.length
