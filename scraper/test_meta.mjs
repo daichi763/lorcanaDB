@@ -509,6 +509,38 @@ console.log('\n[9] ソース定義の整合性');
     (ms.sources || []).filter((s) => s.is_official === 1).every((s) => Number(s.trust) >= 4),
     '公式ソースの trust は 4 以上'
   );
+  // ---- 13弾デッキ収集（60枚は下限）----
+  {
+    const mt = readFileSync('src/lib/meta.ts', 'utf8');
+    ok(/\/\\d\\s\*枚\//.test(mt), '合計行（「N枚」）をカード行から除外している');
+    ok(/total < 60/.test(mt), '60枚は下限として判定する（61枚以上は正当）');
+    ok(!/total !== 60/.test(mt), '「60枚ちょうど」の判定が残っていない');
+    ok(/under_60/.test(mt), '60枚未満の除外理由を under_60 で持つ');
+    ok(/collectJpDecksBySeason/.test(mt), '弾別のデッキ収集関数がある');
+    ok(/matchJpDeckCardName/.test(mt), 'ソングカード表記に対応した突合関数がある');
+    ok(/rematchDeckCards/.test(mt), '既存デッキを再突合できる');
+    ok(/decodeDeckShareCode/.test(mt), '公式デッキビルダー共有コードを復号できる');
+    ok(/extractDeckShareLinks/.test(mt), '記事から共有リンクを抽出できる');
+
+    const pd = readFileSync('public/static/page-deck.js', 'utf8');
+    ok(/total < A\.DECK_SIZE/.test(pd), 'ビルダーは60枚未満だけをエラーにする');
+    ok(/total >= A\.DECK_SIZE/.test(pd), 'ビルダーは60枚以上を有効なデッキとみなす');
+    ok(!/total !== A\.DECK_SIZE/.test(pd), 'ビルダーに「60枚ちょうど」の判定が残っていない');
+
+    const ad = readFileSync('src/routes/admin.ts', 'utf8');
+    ok(/\/meta\/decks\/season/.test(ad), '弾別収集のエンドポイントがある');
+    ok(/\/meta\/decks\/social/.test(ad), 'X\/note収集のエンドポイントがある');
+    ok(/\/meta\/decks\/rematch/.test(ad), '再突合のエンドポイントがある');
+
+    const noAuth = await fetch(`${BASE}/api/_ops/meta/decks/season`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    ok(noAuth.status === 401 || noAuth.status === 403, '弾別収集は認証が必要');
+
+    const decks = await (await fetch(`${BASE}/api/meta/decks?jp_only=1&limit=1`)).json();
+    ok((decks.total ?? 0) >= 30, `デッキレシピが30件以上ある（${decks.total}件）`);
+  }
+
 }
 
 console.log(`\n  ${pass}/${pass + fail} passed`);
