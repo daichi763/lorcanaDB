@@ -52,6 +52,7 @@ import {
   openJob,
   type SourceRow,
 } from '../lib/meta';
+import { collectImageDecks } from '../lib/deckOcr';
 import {
   buildKnowledgeRows,
   embedKnowledge,
@@ -638,6 +639,30 @@ admin.post('/meta/decks/social', async (c) => {
       : undefined,
   });
   return c.json({ done: out.remaining === 0, ...out });
+});
+
+/**
+ * X / note のデッキ「画像」を読んでデッキ化する。
+ *
+ * note / X は本文にデッキ表がなく、デッキは1枚の画像として貼られている。
+ * 1記事あたり「画像数 × 段数」回 Vision を呼ぶので遅い。
+ * 既定1記事/回とし、呼び出し側が done まで繰り返す。
+ */
+admin.post('/meta/decks/images', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const body = await c.req.json().catch(() => ({}) as any);
+  const started = Date.now();
+  const out = await collectImageDecks(c.env, c.env.DB, {
+    maxArticles: Number(body?.max) || 1,
+    maxImagesPerArticle: Number(body?.images) || 3,
+    season: body?.season ? String(body.season) : undefined,
+    sourceKeys: Array.isArray(body?.sourceKeys) && body.sourceKeys.length
+      ? body.sourceKeys.map((x: unknown) => String(x))
+      : undefined,
+    model: body?.model ? String(body.model) : undefined,
+  });
+  return c.json({ done: out.remaining === 0, ...out, elapsed_ms: Date.now() - started });
 });
 
 /**

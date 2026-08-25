@@ -110,7 +110,7 @@ export function jstDateOf(sqlUtc: unknown): string {
   return new Date(t + 9 * 3600_000).toISOString().slice(0, 10);
 }
 
-async function politeFetch(
+export async function politeFetch(
   url: string,
   init: RequestInit & { timeoutMs?: number } = {}
 ): Promise<{ status: number; text: string; headers: Headers }> {
@@ -1051,6 +1051,80 @@ export function matchJpDeckCardName(
   return null;
 }
 
+/** 2つのキーの編集距離。上限を超えたら早期に打ち切る（全カード走査するため） */
+function editDistance(a: string, b: string, max: number): number {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const v = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+      cur.push(v);
+      if (v < rowMin) rowMin = v;
+    }
+    // その行の最小値が上限を超えたら、以降どう進んでも上限内に収まらない
+    if (rowMin > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
+}
+
+/**
+ * OCRで読んだカード名を、1文字程度の誤読を許して突合する。
+ *
+ * なぜ必要か:
+ *   デッキ画像のカード名はイラスト下の細い帯にあり、
+ *   Vision は「ディアブロ→ディアプロ」「ピート→ヒート」「エリノア→エリア」
+ *   のように濁点・小文字・末尾を落とす形で誤読する。
+ *   完全一致だけだと実測で 19枚中4枚（21%）を取りこぼした。
+ *
+ * 誤ったカードを混ぜない仕掛け:
+ *   1. まず完全一致（matchJpDeckCardName）を試し、当たればそれを返す。
+ *   2. 近似は「編集距離が閾値以内」かつ「2位の候補より明確に近い」場合だけ採る。
+ *      同点1位が複数ある＝どれか分からないので採らない（null を返す）。
+ *   3. 閾値は名前の長さに比例させる（短い名前で1文字違いは別カードになりやすい）。
+ *
+ * 実測: グランプリ紹介画像1枚（19枠）で、完全一致15件＋近似4件＝19/19。
+ * 近似4件はいずれも2位を1以上引き離した一意の候補だった。
+ */
+export function matchOcrCardName(
+  raw: string,
+  index: CardIndex
+): { id: number; name: string; fuzzy: boolean } | null {
+  const exact = matchJpDeckCardName(raw, index);
+  if (exact) return { ...exact, fuzzy: false };
+
+  const key = joinKey(String(raw ?? '').replace(/[–—-]/g, ''));
+  if (key.length < 2) return null;
+  // 2文字の名前は1文字違うと別カードなので近似しない
+  const max = key.length <= 3 ? 1 : key.length <= 8 ? 2 : 3;
+
+  let best: { d: number; hit: { id: number; name: string } } | null = null;
+  let secondD = Infinity;
+  const consider = (k: string, hit: { id: number; name: string }) => {
+    const d = editDistance(key, k, max);
+    if (d > max) return;
+    if (!best || d < best.d) {
+      if (best) secondD = best.d;
+      best = { d, hit };
+    } else if (d < secondD) {
+      secondD = d;
+    }
+  };
+  for (const [k, hit] of index.byJa) consider(k, hit);
+  for (const [k, hit] of index.byEn) consider(k, hit);
+
+  if (!best) return null;
+  const b = best as { d: number; hit: { id: number; name: string } };
+  // 同点1位が複数（=どれか判別できない）なら採らない。嘘のカードを入れないため
+  if (secondD <= b.d) return null;
+  return { ...b.hit, fuzzy: true };
+}
+
 /**
  * 日本のデッキ記事HTMLを構造化して取り込む。
  *
@@ -1297,11 +1371,20 @@ const DB_CODE_PADDS = ['1', '8', '9', '0'];
 /**
  * 公式デッキビルダーの共有コード1個を復号する。
  *
- * 復号結果は9桁の数字列で、`枚数*10`(3桁) + `カード番号`(3桁) + `弾番号`(3桁)。
- * 実測: サファイア/スティールの共有リンク17種を復号し、合計65枚・
- * 同一カードの重複なしで整合した（カード名もすべて日本語DBに実在）。
+ * 桁の意味は公式の DeckView.vue（common/components/Deck/DeckView.vue）の
+ * createDeckParams() / urlToDeck() をそのまま写したもの。
+ *   6文字コード: [0:3]=sets_order/10, [3:6]=collector_number, [6:9]=枚数
+ *   4文字コード: [0:2]=sets_order/10, [2:5]=collector_number, [5:6]=枚数
+ * sets_order は 10 未満なら *100、10 以上なら *10 で元の値に戻す。
+ *
+ * 以前は「先頭3桁が枚数*10」と誤解しており、`075178002`（弾750/No.178/2枚）を
+ * 枚数7.5と読んで捨てていた。その結果デッキ合計が58枚になり取り込めなかった。
+ * 実測: サファイア/スティールの共有リンク17コードが合計ちょうど60枚になり、
+ * 17枚すべて日本語DBの (collector_number, sets_order) に解決した。
  */
-export function decodeDeckShareCode(code: string): { qty: number; num: number; set: number } | null {
+export function decodeDeckShareCode(
+  code: string
+): { qty: number; collectorNumber: number; setsOrder: number } | null {
   let txt = String(code ?? '');
   for (const p of DB_CODE_PADDS) txt = txt.split(p).join('');
   let ret = '';
@@ -1318,14 +1401,18 @@ export function decodeDeckShareCode(code: string): { qty: number; num: number; s
     if (ret.length % 3 === 1) ret = `00${ret}`;
     else if (ret.length % 3 === 2) ret = `0${ret}`;
   }
-  if (ret.length !== 9) return null;
-  const qty = Number(ret.slice(0, 3)) / 10;
-  const num = Number(ret.slice(3, 6));
-  const set = Number(ret.slice(6, 9));
-  // 枚数は整数でなければ復号の解釈ミス。黙って通すと嘘のデッキができる
+  // 4文字コードと6文字コードで桁の切り位置が違う（公式実装と同じ分岐）
+  const short = String(code ?? '').length === 4;
+  const need = short ? 6 : 9;
+  if (ret.length < need) return null;
+  const setHead = Number(short ? ret.slice(0, 2) : ret.slice(0, 3));
+  const collectorNumber = Number(short ? ret.slice(2, 5) : ret.slice(3, 6));
+  const qty = Number(short ? ret.slice(5, 6) : ret.slice(6, 9));
+  if (!Number.isFinite(setHead) || !Number.isFinite(collectorNumber) || !Number.isFinite(qty)) return null;
+  const setsOrder = setHead < 10 ? setHead * 100 : setHead * 10;
+  if (!setsOrder || !collectorNumber) return null;
   if (!Number.isInteger(qty) || qty < 1 || qty > 60) return null;
-  if (!num || !set) return null;
-  return { qty, num, set };
+  return { qty, collectorNumber, setsOrder };
 }
 
 /** 記事HTMLから公式デッキビルダーの共有リンク（cs/ds）を全部取り出す */
@@ -1447,6 +1534,41 @@ export async function collectSocialDecks(
            remaining: Math.max(0, pending.length - batch.length), rejected };
 }
 
+/**
+ * 記事HTMLから「デッキ表の候補になる画像」URLを取り出す。
+ *
+ * note の本文画像は assets.st-note.com/img/... に置かれている。
+ * 実測: 取得する際に `?width=2000` を付けないと帯のカード名が小さすぎて読めない。
+ * （width=1200 では 19枚中0枚、width=2000 で 19/19 読めた。原寸 4096px は
+ *   取得が遅すぎて Vision 側のダウンロードがタイムアウトする。）
+ *
+ * プロフィール画像や見出し画像はデッキ表でないので除く。
+ */
+export function extractArticleImages(html: string, opts: { limit?: number } = {}): string[] {
+  const limit = Math.max(1, Math.min(12, opts.limit ?? 8));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const re = /https?:\\?\/\\?\/assets\.st-note\.com\/(?:img|production)\/[A-Za-z0-9._\\/-]+\.(?:png|jpe?g|webp)/gi;
+  for (const m of html.matchAll(re)) {
+    // JSON 埋め込みでエスケープされた \\u002F / \\/ を戻す
+    const clean = m[0].replace(/\\u002F/gi, '/').replace(/\\\\\//g, '/');
+    /*
+     * プロフィール・アイコンに加えて、note の見出し画像（アイキャッチ）も除く。
+     * アイキャッチは production/uploads/images/.../rectangle_large_type_2_*
+     * という決まった形で、デッキ表ではなく記事のサムネイル。
+     * 実測: これを読ませると Vision が JSON でない散文を返し失敗した。
+     */
+    if (/profile|avatar|icon|favicon|ogp|logo|rectangle_large/i.test(clean)) continue;
+    const key = clean.replace(/\?.*$/, '');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    // 帯の文字が読める幅で取る（上記の実測による）
+    out.push(`${key}?width=2000`);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 /** 共有コード群を1デッキとして meta_decks / meta_deck_cards に書き込む */
 async function importShareDeck(
   db: D1Database,
@@ -1460,16 +1582,23 @@ async function importShareDeck(
     const d = decodeDeckShareCode(code);
     if (!d) continue;
     total += d.qty;
-    const like = `${String(d.num).padStart(3, '0')}_DLCS${d.set}\\_%`;
+    /*
+     * 公式デッキビルダーと同じキー (collector_number, sets_order) で引く。
+     * card_file の文字列マッチだと同一カードの別レアリティで揺れるので使わない。
+     */
     const row = await db
-      .prepare("SELECT id, card_name, version FROM cards WHERE card_file LIKE ? ESCAPE '\\' LIMIT 1")
-      .bind(like)
+      .prepare(
+        `SELECT id, card_name, version FROM cards
+          WHERE collector_number = ? AND sets_order = ?
+          ORDER BY id LIMIT 1`
+      )
+      .bind(d.collectorNumber, d.setsOrder)
       .first<{ id: number; card_name: string; version: string | null }>();
     if (row?.id) {
       const nm = row.version ? `${row.card_name} – ${row.version}` : String(row.card_name);
       cards.push({ card_id: Number(row.id), card_name: nm, raw: code, qty: d.qty });
     } else {
-      const nm = `未特定カード（${d.set}弾 ${String(d.num).padStart(3, '0')}）`;
+      const nm = `未特定カード（${Math.round(d.setsOrder / 100)}弾 ${String(d.collectorNumber).padStart(3, '0')}）`;
       missing.push(nm);
       cards.push({ card_id: null, card_name: nm, raw: code, qty: d.qty });
     }

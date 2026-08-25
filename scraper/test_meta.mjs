@@ -539,6 +539,35 @@ console.log('\n[9] ソース定義の整合性');
 
     const decks = await (await fetch(`${BASE}/api/meta/decks?jp_only=1&limit=1`)).json();
     ok((decks.total ?? 0) >= 30, `デッキレシピが30件以上ある（${decks.total}件）`);
+
+    // ---- 共有コードの桁構造（公式 DeckView.vue に準拠）----
+    ok(/collectorNumber/.test(mt), '共有コードは collector_number を返す');
+    ok(/setsOrder/.test(mt), '共有コードは sets_order を返す');
+    ok(!/Number\(ret\.slice\(0, 3\)\) \/ 10/.test(mt),
+       '「先頭3桁が枚数*10」という誤った解釈が消えている');
+    ok(/collector_number = \? AND sets_order = \?/.test(mt),
+       'カードは (collector_number, sets_order) で引く');
+
+    // ---- X / note の画像解析によるデッキ収集 ----
+    ok(/extractArticleImages/.test(mt), '記事からデッキ画像を抽出できる');
+    ok(/width=2000/.test(mt), '帯の文字が読める幅で画像を取る');
+    ok(/rectangle_large/.test(mt), 'note の見出し画像をデッキ表から除外する');
+    ok(/matchOcrCardName/.test(mt), 'OCR誤読を近似一致で救う関数がある');
+    ok(/secondD <= b\.d/.test(mt), '同点1位が複数の近似は採らない');
+
+    const dk = readFileSync('src/lib/deckOcr.ts', 'utf8');
+    ok(/collectImageDecks/.test(dk), '画像からデッキを収集する関数がある');
+    ok(/段目の横一列だけ/.test(dk), '段ごとに読ませる（一括読みでは精度が出ない）');
+    ok(/total < 60/.test(dk), '読み取り結果が60枚未満なら採らない');
+    ok(/low_match/.test(dk), '突合率が低い読み取りは採らない');
+    ok(/カード名一覧/.test(dk), 'カード名はDBの語彙から選ばせる');
+    ok(!/ocr_text.*本文/.test(dk) && /deck_total=/.test(dk),
+       '非公式の本文は保存せず、枚数だけを記録する');
+    ok(/\/meta\/decks\/images/.test(ad), '画像収集のエンドポイントがある');
+    const noAuth2 = await fetch(`${BASE}/api/_ops/meta/decks/images`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    ok(noAuth2.status === 401 || noAuth2.status === 403, '画像収集は認証が必要');
   }
 
 }
