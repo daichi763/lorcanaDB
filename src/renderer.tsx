@@ -52,12 +52,20 @@ export const renderer = jsxRenderer(({ children, title, nav }) => {
                   <i class="fas fa-chart-line mr-1"></i>
                   <span class="hidden sm:inline">最新環境</span>
                 </a>
+                {/* デッキは「組む」と「読む」で操作も滞在時間も違うので別タブにしている */}
                 <a
                   href="/deck"
                   class={`px-3 py-1.5 rounded-md transition ${nav === 'deck' ? 'bg-slate-700 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
                 >
                   <i class="fas fa-layer-group mr-1"></i>
-                  <span class="hidden sm:inline">デッキ</span>
+                  <span class="hidden sm:inline">デッキビルド</span>
+                </a>
+                <a
+                  href="/recipes"
+                  class={`px-3 py-1.5 rounded-md transition ${nav === 'recipes' ? 'bg-slate-700 text-white' : 'text-slate-300 hover:bg-slate-800'}`}
+                >
+                  <i class="fas fa-bookmark mr-1"></i>
+                  <span class="hidden sm:inline">デッキレシピ</span>
                 </a>
                 <a
                   href="/synergy"
@@ -144,6 +152,7 @@ export const renderer = jsxRenderer(({ children, title, nav }) => {
         <script src="/static/page-search.js"></script>
         <script src="/static/page-card.js"></script>
         <script src="/static/page-deck.js"></script>
+        <script src="/static/page-recipes.js"></script>
         <script src="/static/page-synergy.js"></script>
         <script src="/static/page-rules.js"></script>
         <script src="/static/page-meta.js"></script>

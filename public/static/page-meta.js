@@ -621,8 +621,8 @@
         `<div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">` +
         list.map(deckCardHtml).join('') +
         `</div>` +
-        `<p class="mt-3 text-center"><a href="/deck#meta-recipes" class="text-xs text-sky-300 hover:text-sky-200 underline">` +
-        `デッキタブでレシピ一覧を見る（${d.total}件）<i class="fas fa-arrow-right ml-1"></i></a></p>`
+        `<p class="mt-3 text-center"><a href="/recipes" class="text-xs text-sky-300 hover:text-sky-200 underline">` +
+        `デッキレシピタブで一覧を見る（${d.total}件）<i class="fas fa-arrow-right ml-1"></i></a></p>`
     );
   }
 
@@ -641,7 +641,7 @@
       `<article class="bg-slate-800/60 rounded border border-slate-700 p-2.5">` +
       `<div class="flex items-start justify-between gap-2 mb-1">` +
       `<h3 class="text-xs font-semibold text-slate-100 leading-snug">` +
-      `<a href="/deck?meta=${dk.id}" class="hover:text-amber-300">${esc(dk.name || 'デッキ')}</a></h3>${place}</div>` +
+      `<a href="/recipes?meta=${dk.id}" class="hover:text-amber-300">${esc(dk.name || 'デッキ')}</a></h3>${place}</div>` +
       `<p class="mb-1">${inks}</p>` +
       `<p class="text-[10px] text-slate-400">` +
       (dk.event_name ? `${esc(dk.event_name)} ・ ` : '') +

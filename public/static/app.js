@@ -265,6 +265,7 @@
     }
     else if (path.startsWith('/cards/')) window.initCardDetailPage && window.initCardDetailPage();
     else if (path === '/deck') window.initDeckPage && window.initDeckPage();
+    else if (path === '/recipes') window.initRecipesPage && window.initRecipesPage();
     else if (path === '/synergy') window.initSynergyPage && window.initSynergyPage();
     else if (path === '/rules') window.initRulesPage && window.initRulesPage();
     else if (path === '/meta') window.initMetaPage && window.initMetaPage();

@@ -159,13 +159,23 @@ app.get('/cards/:key', (c) =>
   )
 );
 
-// ============================ デッキビルダー ============================
-app.get('/deck', (c) =>
-  c.render(
+// ============================ デッキビルド ============================
+// 「自分で組む」編集画面。収集レシピの閲覧は /recipes に分離した（同居させると
+// ビルダー利用者が長いレシピ一覧を跨ぐことになり、逆も待たされる）
+app.get('/deck', (c) => {
+  /*
+   * レシピ分離前の /deck?meta=<id> は、外部サイトや最新環境ページから
+   * 共有されている可能性がある。分離後もそのまま開けるよう /recipes へ転送する。
+   * 転送しないと「リンクを開いたのに何も出ない」という壊れ方になる。
+   */
+  const meta = c.req.query('meta');
+  if (meta) return c.redirect(`/recipes?meta=${encodeURIComponent(meta)}`, 301);
+
+  return c.render(
     <div class="max-w-7xl mx-auto px-4 py-5">
       <div class="flex flex-wrap items-center justify-between gap-2 mb-4">
         <h1 class="text-lg font-bold">
-          <i class="fas fa-layer-group text-amber-300 mr-1.5"></i>デッキビルダー
+          <i class="fas fa-layer-group text-amber-300 mr-1.5"></i>デッキビルド
         </h1>
         <div class="flex flex-wrap gap-2 text-xs">
           <button id="deck-import-btn" class="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 rounded font-semibold">
@@ -251,25 +261,58 @@ app.get('/deck', (c) =>
         </aside>
       </div>
 
-      {/*
-        環境情報の収集で取得したデッキレシピ。
-        日本で組めるもの（playable_jp=1）のみを保存・表示する。
-        まとめ本文では非公式ソースを明記しないが、デッキレシピは仕様§1.3の例外として
-        出典URLを必ず明記する。
-      */}
-      <section id="meta-recipes" class="mt-8 scroll-mt-20">
-        <div class="flex items-baseline justify-between gap-3 mb-1">
-          <h2 class="text-lg font-bold text-slate-100">
-            <i class="fas fa-bookmark mr-2 text-sky-400"></i>
-            収集したデッキレシピ
-          </h2>
-          <a href="/meta" class="text-xs text-sky-400 hover:text-sky-300 shrink-0">
-            最新環境情報へ <i class="fas fa-arrow-right ml-0.5"></i>
+      {/* レシピは別タブ。ここでは導線だけ置く（探して迷わないように） */}
+      <p class="mt-8 pt-4 border-t border-slate-800 text-xs text-slate-500">
+        <i class="fas fa-bookmark mr-1.5 text-sky-400"></i>
+        大会結果などから収集した構築を見たいときは
+        <a href="/recipes" class="text-sky-400 hover:text-sky-300 underline mx-1">デッキレシピ</a>
+        タブへ。レシピからこのビルダーへ読み込むこともできます。
+      </p>
+
+      <div id="lightbox" role="dialog" aria-modal="true" aria-label="カード画像拡大">
+        <button
+          id="lightbox-close"
+          class="absolute top-4 right-4 w-10 h-10 rounded-full bg-slate-800/80 text-white grid place-items-center hover:bg-slate-700"
+          aria-label="閉じる"
+        >
+          <i class="fas fa-times"></i>
+        </button>
+        <img id="lightbox-img" src="" alt="" />
+      </div>
+    </div>,
+    { title: 'デッキビルド', nav: 'deck' }
+  );
+});
+
+// ============================ デッキレシピ ============================
+/*
+ * 環境情報の収集で取得したデッキレシピの閲覧画面。
+ * 日本で組めるもの（playable_jp=1）のみを保存・表示する。
+ * まとめ本文では非公式ソースを明記しないが、デッキレシピは仕様§1.3の例外として
+ * 出典URLを必ず明記する。
+ */
+app.get('/recipes', (c) =>
+  c.render(
+    <div class="max-w-7xl mx-auto px-4 py-5">
+      <div class="flex flex-wrap items-center justify-between gap-2 mb-1">
+        <h1 class="text-lg font-bold">
+          <i class="fas fa-bookmark text-sky-400 mr-1.5"></i>デッキレシピ
+        </h1>
+        <div class="flex flex-wrap gap-2 text-xs">
+          <a href="/deck" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded">
+            <i class="fas fa-layer-group mr-1"></i>デッキビルドへ
+          </a>
+          <a href="/meta" class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded">
+            <i class="fas fa-chart-line mr-1"></i>最新環境情報へ
           </a>
         </div>
+      </div>
+
+      <section id="meta-recipes" class="mt-3 scroll-mt-20">
         <p class="text-xs text-slate-500 mb-3">
           大会結果やコミュニティから収集したレシピのうち、<strong class="text-slate-400">日本で発売済みのカードのみで組めるもの</strong>を掲載しています。
-          各レシピには出典元を明記しています。
+          各レシピには出典元を明記しています。レシピを開くと
+          <strong class="text-slate-400">「ビルダーに読み込む」</strong>からデッキビルドタブへ引き継げます。
         </p>
         <div id="meta-recipes-filters" class="flex flex-wrap gap-2 mb-3"></div>
         <div id="meta-recipes-list" class="grid gap-3 md:grid-cols-2"></div>
@@ -290,7 +333,7 @@ app.get('/deck', (c) =>
         <img id="lightbox-img" src="" alt="" />
       </div>
     </div>,
-    { title: 'デッキビルダー', nav: 'deck' }
+    { title: 'デッキレシピ', nav: 'recipes' }
   )
 );
 

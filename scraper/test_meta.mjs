@@ -167,11 +167,43 @@ console.log('\n[5] 表示側の受け皿');
   }
   ok(/page-meta\.js/.test(meta), '/meta が page-meta.js を読み込む');
 
+  /*
+   * デッキレシピは /deck（デッキビルド）から /recipes へ分離した。
+   * 「組む」編集画面と「読む」閲覧画面で目的が違い、同居させると
+   * 双方の利用者が相手側の描画を跨ぐことになるため。
+   * 分離が崩れる（要素が両方に出る／片方から消える）と気付きにくいので、
+   * 存在確認だけでなく「反対側に無いこと」まで検査する。
+   */
+  const recipes = await fetch(BASE + '/recipes').then((r) => r.text());
+  const dRec = new JSDOM(recipes).window.document;
+  for (const id of ['meta-recipes', 'meta-recipes-filters', 'meta-recipes-list', 'meta-recipes-more', 'meta-recipe-detail', 'meta-credits']) {
+    ok(!!dRec.getElementById(id), `/recipes に #${id} がある`);
+  }
+  ok(/page-recipes\.js/.test(recipes), '/recipes が page-recipes.js を読み込む');
+  for (const id of ['pool-results', 'deck-drop-zone', 'deck-list']) {
+    ok(!dRec.getElementById(id), `/recipes にビルダーの #${id} が無い`);
+  }
+
   const deck = await fetch(BASE + '/deck').then((r) => r.text());
   const dDeck = new JSDOM(deck).window.document;
-  for (const id of ['meta-recipes', 'meta-recipes-filters', 'meta-recipes-list', 'meta-recipes-more', 'meta-recipe-detail', 'meta-credits']) {
+  for (const id of ['pool-results', 'deck-drop-zone', 'deck-list']) {
     ok(!!dDeck.getElementById(id), `/deck に #${id} がある`);
   }
+  for (const id of ['meta-recipes', 'meta-recipes-list', 'meta-recipe-detail']) {
+    ok(!dDeck.getElementById(id), `/deck にレシピの #${id} が無い`);
+  }
+  ok(/href="\/recipes"/.test(deck), '/deck からレシピタブへの導線がある');
+
+  // 分離前に共有された /deck?meta=<id> のリンクが死なないこと
+  const redir = await fetch(BASE + '/deck?meta=1', { redirect: 'manual' });
+  ok(redir.status === 301, '/deck?meta= が 301 を返す');
+  ok(
+    (redir.headers.get('location') || '').includes('/recipes?meta=1'),
+    '/deck?meta=1 が /recipes?meta=1 へ転送される'
+  );
+
+  // ナビゲーションに両タブが並ぶこと
+  ok(/デッキビルド/.test(deck) && /デッキレシピ/.test(deck), 'ナビに「デッキビルド」「デッキレシピ」が並ぶ');
 
   const admin = await fetch(BASE + '/x7f2q9').then((r) => r.text());
   const dAdm = new JSDOM(admin).window.document;
@@ -194,10 +226,16 @@ console.log('\n[6] フロント側スクリプトの静的検査');
   ok(/renderCredits/.test(pm), 'renderCredits を実装している');
   ok(/LorMeta\s*=\s*\{[^}]*renderCredits/.test(pm), 'renderCredits を LorMeta 経由で共有する');
 
+  // レシピ描画は page-deck.js から page-recipes.js へ移した（タブ分割）
+  const pr = readFileSync('public/static/page-recipes.js', 'utf8');
+  ok(/LorMeta\?\.renderCredits/.test(pr), 'page-recipes.js が帰属表示を呼ぶ');
+  ok(/jp_only=1/.test(pr), 'デッキレシピタブは playable_jp=1 のみ取得する');
+  ok(/rel="noopener noreferrer nofollow"/.test(pr), 'レシピ出典リンクに nofollow を付ける');
+
+  // 分割後にレシピ処理が両ファイルへ二重化していないこと（片方だけ直す事故を防ぐ）
   const pd = readFileSync('public/static/page-deck.js', 'utf8');
-  ok(/LorMeta\?\.renderCredits/.test(pd), 'page-deck.js が帰属表示を呼ぶ');
-  ok(/jp_only=1/.test(pd), 'デッキタブは playable_jp=1 のみ取得する');
-  ok(/rel="noopener noreferrer nofollow"/.test(pd), 'レシピ出典リンクに nofollow を付ける');
+  ok(!/meta-recipes-list/.test(pd), 'page-deck.js にレシピ描画が残っていない');
+  ok(/lorfan\.deck/.test(pd) && /lorfan\.deck/.test(pr), 'ビルダーとレシピが同じ localStorage キーを使う');
 
   const pa = readFileSync('public/static/page-admin.js', 'utf8');
   ok(/\/meta\/collect/.test(pa) && /\/meta\/aggregate/.test(pa) && /\/meta\/summarize/.test(pa) && /\/meta\/memory/.test(pa), '管理画面が4段すべてを叩く');
