@@ -1577,17 +1577,28 @@ export async function collectTopdeck(
   opts: { days?: number; minPlayers?: number; maxEvents?: number } = {}
 ): Promise<{ status: number; events: number; decks: number } & UpsertResult> {
   const empty = { inserted: 0, updated: 0, unchanged: 0 };
-  const days = Math.max(1, Math.min(30, opts.days ?? 10));
-  const minPlayers = opts.minPlayers ?? 16;
+  // 実キーで測定した結果、Lorcana の登録大会は非常に疎である（2026-08 時点）。
+  //   直近30日 = 1件 / 直近90日 = 4件 / 直近365日 = 30件
+  //   うち参加16人以上は365日でも 6件だけ
+  // 従って「30日×16人以上」ではほぼ常に0件になる。
+  // 窓を広く取り、しきい値も下げて意味のある件数を拾う。
+  // 同じ大会を毎日取り直しても upsert で unchanged になるので害はない。
+  const days = Math.max(1, Math.min(365, opts.days ?? 120));
+  const minPlayers = opts.minPlayers ?? 8;
   const maxEvents = Math.max(1, Math.min(40, opts.maxEvents ?? 15));
 
   const r = await politeFetch(src.url, {
     method: 'POST',
     headers: { Authorization: apiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      // game / format は大文字小文字まで一致が必要（公式ドキュメントの一覧表記に合わせる）。
-      // 「Lorcana」ではなく「Disney Lorcana」が正しいゲーム名。
-      game: 'Disney Lorcana',
+      // game / format は大文字小文字まで一致が必要。
+      //
+      // 公式ドキュメントのゲーム一覧には「Disney Lorcana」と書かれているが、
+      // 実キーで検証したところ 'Disney Lorcana' は常に 0 件で、
+      // 実データに入っているゲーム名は 'Lorcana' だった（2026-08 時点）。
+      // 大会名に "Disney Lorcana" が入っていてもフィールド値は 'Lorcana'。
+      // ドキュメントより実データを優先する。
+      game: 'Lorcana',
       format: 'Core Constructed',
       last: days,
       participantMin: minPlayers,
@@ -1598,7 +1609,16 @@ export async function collectTopdeck(
   });
 
   if (r.status !== 200) {
-    await markSource(db, src.key, r.status, `http ${r.status}`);
+    // 429 は 100req/min のレート制限。日次1リクエストなので通常は起きないが、
+    // 手動で連続実行したときに理由が分かるよう retryAfterSeconds を残す。
+    let extra = '';
+    if (r.status === 429) {
+      const sec = (() => {
+        try { return JSON.parse(r.text)?.retryAfterSeconds ?? null; } catch { return null; }
+      })();
+      extra = sec ? ` retry_after=${sec}s` : ' rate limited';
+    }
+    await markSource(db, src.key, r.status, `http ${r.status}${extra}`);
     return { status: r.status, events: 0, decks: 0, ...empty };
   }
 
@@ -1633,6 +1653,20 @@ export async function collectTopdeck(
     const standings: any[] = Array.isArray(t?.standings) ? t.standings : [];
     const players = Number(t?.participantCount ?? t?.players ?? standings.length) || standings.length;
     const url = `https://topdeck.gg/event/${encodeURIComponent(tid)}`;
+
+    // TopDeck は誰でも大会を立てられるため、テスト用・デモ用の登録が混ざる。
+    // 環境情報の材料としては雑音なので落とす（実際に "lorcana demo" が入ってきた）。
+    const lower = name.toLowerCase();
+    const isNoise =
+      /\b(demo|test|testing|sample|practica|練習|テスト)\b/.test(lower) ||
+      lower.startsWith('demo') ||
+      lower.startsWith('test');
+    if (isNoise) continue;
+
+    // デッキリストが1件も無い大会は「誰が何で勝ったか」が分からず、
+    // メタ集計にもデッキレシピにも使えない。参加人数だけの行は作らない。
+    const hasDecklist = standings.some((s) => s?.decklist);
+    if (!hasDecklist) continue;
 
     // raw_items へ（要約の材料）。本文は持たず、数値と名称のみ
     items.push({
@@ -1864,7 +1898,7 @@ export async function collectOne(
             detail: { skipped: 'no_topdeck_api_key' },
           };
         }
-        const r = await collectTopdeck(db, src, topdeckKey, { days: 10, minPlayers: 16 });
+        const r = await collectTopdeck(db, src, topdeckKey, { days: 120, minPlayers: 8 });
         return {
           ...base, ok: r.status === 200, status: r.status,
           inserted: r.inserted, updated: r.updated,

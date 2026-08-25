@@ -236,14 +236,41 @@ console.log('\n[8] APIキー未設定ソースは「スキップ＝成功扱い�
   ok(Array.isArray(ms.sources), `認証後に詳細な状態が取れる (${ms.sources?.length} ソース)`);
   ok(typeof ms.collected_today === 'number', '本日の収集数が取れる');
 
-  // TopDeck.gg は TOPDECK_API_KEY 未設定なのでスキップされ、ok:true で返る
+  // TopDeck.gg は APIキーの有無で挙動が変わる。どちらでも「失敗扱いにしない」ことが要件。
+  //   キー未設定 → detail.skipped === 'no_topdeck_api_key'
+  //   キー設定済 → 実際に収集し detail.events / decks_with_list が返る
   const cx = await fetch(BASE + '/api/_ops/meta/collect', {
     method: 'POST',
     headers: H,
     body: JSON.stringify({ source: 'topdeck_gg' }),
   }).then((r) => r.json());
-  ok(cx.ok === true, 'TopDeck.gg はAPIキー未設定でも失敗扱いにならない');
-  ok(cx.detail?.skipped === 'no_topdeck_api_key', `スキップ理由が明示される (${cx.detail?.skipped})`);
+  ok(cx.ok === true, 'TopDeck.gg は成功扱いで返る（キー有無を問わず）');
+  const tdSkipped = cx.detail?.skipped === 'no_topdeck_api_key';
+  const tdCollected = typeof cx.detail?.events === 'number';
+  ok(
+    tdSkipped || tdCollected,
+    tdSkipped
+      ? 'APIキー未設定時はスキップ理由が明示される (no_topdeck_api_key)'
+      : `APIキー設定済のため実収集された (大会${cx.detail?.events}件 / デッキリスト${cx.detail?.decks_with_list}件)`
+  );
+
+  // TopDeck は誰でも大会を立てられるため、デモ/テスト大会や
+  // デッキリストの無い大会が混ざる。これらは材料にならないので除外していること。
+  const recent = await fetch(BASE + '/api/meta/events?scope=recent&limit=30').then((r) => r.json());
+  const tdEvents = (recent.events || []).filter((e) => (e.note || '').includes('TopDeck'));
+  ok(
+    tdEvents.every((e) => !/\b(demo|test|practica)\b/i.test(e.name || '')),
+    `TopDeck 由来のデモ/テスト大会が混ざらない (${tdEvents.length}件検査)`
+  );
+  ok(
+    tdEvents.every((e) => Number(e.players) > 0),
+    'TopDeck 由来の大会は参加人数を持つ'
+  );
+  // §1.3: topdeck.gg は非公式ドメインなので大会URLは表に出さない
+  ok(
+    tdEvents.every((e) => !e.url),
+    'TopDeck 由来の大会は本文側にURLを出さない（帰属は専用欄で表示）'
+  );
 
   // X 公式APIも同様（有料プラン前提のため未設定時はスキップ）
   const xx = await fetch(BASE + '/api/_ops/meta/collect', {
