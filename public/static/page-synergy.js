@@ -285,8 +285,21 @@ window.initSynergyPage = function () {
            const tags = [];
            if (m.vector_search) tags.push('<i class="fas fa-vector-square mr-1"></i>意味ベクトル検索');
            if (m.ability_knowledge) tags.push(`<i class="fas fa-book-open mr-1"></i>能力裁定 ${m.ability_knowledge} 件（事前学習済み）`);
-           if (m.recalled) tags.push(`<i class="fas fa-brain mr-1"></i>過去の検討 ${m.recalled} 件を参照`);
+           if (m.recalled) {
+             // カード指定時は「同じカードでの過去の検討」、自由記述だけのときは
+             // 「別の相談で高評価だった事例」。同じ文言にすると後者を実績と誤解させる
+             tags.push(
+               d.base
+                 ? `<i class="fas fa-brain mr-1"></i>過去の検討 ${m.recalled} 件を参照`
+                 : `<i class="fas fa-brain mr-1"></i>他の相談での高評価 ${m.recalled} 件を参考`
+             );
+           }
            if (m.official_faqs) tags.push(`<i class="fas fa-circle-question mr-1"></i>公式Q&amp;A ${m.official_faqs} 件を根拠に`);
+           // 環境情報は「賞味期限のある知識」なので、参照したことと基準日を必ず見せる
+           if (m.meta_context) {
+             const asOf = d.meta && d.meta.as_of ? `（${esc(d.meta.as_of)}時点）` : '';
+             tags.push(`<i class="fas fa-chart-line mr-1"></i>最新環境情報 ${m.meta_context} 件${asOf}`);
+           }
            return tags.length
              ? `<div class="flex flex-wrap gap-1.5 mt-2.5 pt-2 border-t border-slate-700/70">
                   ${tags.map((t) => `<span class="text-[10px] px-2 py-0.5 bg-emerald-950/50 border border-emerald-800/60 rounded-full text-emerald-200">${t}</span>`).join('')}

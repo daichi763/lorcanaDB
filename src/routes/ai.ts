@@ -178,7 +178,10 @@ ai.post('/synergy', async (c) => {
   await ensureTables(db);
 
   // ---- キャッシュ照会（レート制限より前に見る = キャッシュヒットは無料）----
-  const ck = cacheKey(JSON.stringify({ cardFile, freeText, restrictInk, want, v: 3 }));
+  // v は「同じ入力でも結果の作り方が変わった」ときに上げる。
+  // 上げ忘れると仕様変更後も24時間は旧結果が返り、修正が効いていないように見える。
+  // v4: 自由記述モードでも過去の検討結果（base_id IS NULL）を想起するようにした
+  const ck = cacheKey(JSON.stringify({ cardFile, freeText, restrictInk, want, v: 4 }));
   const now = Math.floor(Date.now() / 1000);
   const hit = await db
     .prepare('SELECT payload, ts FROM ai_cache WHERE key = ? AND ts >= ?')
@@ -326,6 +329,7 @@ ai.post('/synergy', async (c) => {
       restrictInk,
       vectorHits,
       memoryHits,
+      memoryScope: base ? 'card' : 'text',
       // 候補を60→120枚に拡大。実測では入力トークンが倍増しても所要時間はほぼ変わらず
       // （32.6秒 vs 34.0秒）、見落としの削減にそのまま効く。
       limit: 120,
@@ -383,6 +387,9 @@ ai.post('/synergy', async (c) => {
       restrictInk,
       abilityKnowledge,
       memoryNotes,
+      // 起点カード無しの記憶は「別の自由記述で高評価だった事例」なので、
+      // 同一条件の再評価とは信頼度が違う。プロンプト側で表現を分ける
+      memoryScope: base ? 'card' : 'text',
       faqs: faqHits.map((f) => ({
         category: f.category,
         question: f.question,

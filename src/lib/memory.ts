@@ -378,7 +378,22 @@ export async function loadAbilityKnowledge(
 
 export type MemoryHit = { partner_id: number; score: number; reason: string; hits: number };
 
-/** この起点カードについて過去に高評価だったパートナーを思い出す */
+/**
+ * この起点カードについて過去に高評価だったパートナーを思い出す。
+ *
+ * baseId が null（＝自由記述だけの探索）のときは、同じく起点カードを持たない
+ * 記録（base_id IS NULL）を思い出す。
+ *
+ * かつては baseId が null なら無条件で空配列を返していた。しかし
+ * rememberSynergy は base_id=NULL の行も書き込むため、自由記述で貯めた記憶が
+ * 一度も読み出されない「書き込むだけの死蔵データ」になっていた。
+ * 自由記述は画面の主入力なので、最も使われる経路が記憶の恩恵をまったく
+ * 受けていなかったことになる。
+ *
+ * ただし base_id=NULL の記録は「あらゆる自由記述の寄せ集め」で、
+ * 今回の質問と無関係な事例も混ざる。そのため起点カードありの場合より
+ * 条件を厳しくし、繰り返し選ばれた（hits>=2）確度の高い事例に絞る。
+ */
 export async function recallSynergy(
   db: D1Database,
   baseId: number | null,
@@ -393,7 +408,14 @@ export async function recallSynergy(
           )
           .bind(baseId, limit)
           .all()
-      : { results: [] };
+      : await db
+          .prepare(
+            `SELECT partner_id, score, reason, hits FROM synergy_memory
+              WHERE base_id IS NULL AND hits >= 2
+              ORDER BY hits DESC, score DESC LIMIT ?`
+          )
+          .bind(limit)
+          .all();
     return ((rows.results ?? []) as any[]).map((r) => ({
       partner_id: Number(r.partner_id),
       score: Number(r.score),

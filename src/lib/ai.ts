@@ -332,6 +332,12 @@ export type RetrieveOptions = {
   vectorHits?: Array<{ id: number; sim: number }>;
   /** 過去に高評価だったパートナー（記憶による加点） */
   memoryHits?: Array<{ partner_id: number; score: number; hits: number }>;
+  /**
+   * 記憶の出自。起点カード無し（自由記述）の記憶は今回の条件と無関係な
+   * 事例が混ざるため、加点を弱める。同じ重みだと「過去によく選ばれた汎用カード」
+   * が質問内容と関係なく上位に居座り、候補の多様性が失われる。
+   */
+  memoryScope?: 'card' | 'text';
 };
 
 /**
@@ -531,12 +537,17 @@ export async function retrieveCandidates(db: D1Database, o: RetrieveOptions): Pr
   await Promise.all(jobs);
 
   // ---------- 過去の検討結果による加点（記憶） ----------
+  // 起点カード無しの記憶は条件との結びつきが弱いので加点を半分にする
+  const memWeight = o.memoryScope === 'text' ? 0.5 : 1;
   for (const m of o.memoryHits ?? []) {
     const cur = pool.get(m.partner_id);
     if (!cur) continue;
-    // 何度も選ばれているペアほど確度が高いと見なす（最大 +3）
-    cur._score += Math.min(1 + m.hits * 0.5, 3);
-    const why = `過去に高評価（${m.score}点・${m.hits}回）`;
+    // 何度も選ばれているペアほど確度が高いと見なす（最大 +3、自由記述由来は +1.5）
+    cur._score += Math.min(1 + m.hits * 0.5, 3) * memWeight;
+    const why =
+      o.memoryScope === 'text'
+        ? `別の相談で高評価（${m.score}点・${m.hits}回）`
+        : `過去に高評価（${m.score}点・${m.hits}回）`;
     if (!cur._why.includes(why)) cur._why.push(why);
   }
 
@@ -747,6 +758,12 @@ export function buildUserPrompt(args: {
   }>;
   /** 過去に高評価だったシナジー事例（記憶の再利用） */
   memoryNotes?: string[];
+  /**
+   * 記憶の出自。'card' は同じ起点カードでの過去評価（信頼度が高い）、
+   * 'text' は別の自由記述で高評価だった事例（今回の条件とは無関係かもしれない）。
+   * 区別せずに渡すと、無関係な事例をモデルが「実績あり」と誤解して採用してしまう。
+   */
+  memoryScope?: 'card' | 'text';
   /** 意味検索で想起した公式ルールQ&A（公式の公式見解＝最優先の根拠） */
   faqs?: Array<{ category: string; question: string; answer: string; note?: string }>;
   /**
@@ -821,9 +838,14 @@ export function buildUserPrompt(args: {
   }
 
   if (args.memoryNotes?.length) {
-    parts.push(
-      `## 過去の検討結果（同条件で以前に高評価だった組み合わせ。妥当なら再評価し、誤りと判断すれば採用しなくてよい）\n${args.memoryNotes.join('\n')}`
-    );
+    const head =
+      args.memoryScope === 'text'
+        ? '## 参考: 別の相談で高評価だった組み合わせ\n' +
+          '（今回の条件で評価された事例ではない。今回の条件に合う場合のみ採用し、' +
+          '合わなければ無視すること。「実績がある」という理由だけで採用してはならない）'
+        : '## 過去の検討結果（同じ起点カードで以前に高評価だった組み合わせ。' +
+          '妥当なら再評価し、誤りと判断すれば採用しなくてよい）';
+    parts.push(`${head}\n${args.memoryNotes.join('\n')}`);
   }
 
   if (args.metaContext?.length) {
