@@ -825,6 +825,70 @@ const ADMIN_HTML = `<!DOCTYPE html>
       </p>
     </div>
 
+    {/*
+      記憶層ブラウザ。
+      AIの回答品質は記憶層の中身で決まるが、記憶層はベクトル(BLOB)と要約テキストの塊で
+      外から見えない。「古い環境情報を今のことのように話す」等の不具合を切り分けられるよう、
+      中身を一覧し、さらに任意の質問で「実際にどの記憶が引かれるか」を再現できるようにする。
+      読み取り専用（ここから記憶は書き換えられない）。
+    */}
+    <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4 space-y-3">
+      <h2 class="text-sm font-semibold text-slate-300">
+        <i class="fas fa-brain text-indigo-300 mr-1"></i>記憶層ブラウザ
+        <span class="text-[10px] text-slate-500 ml-1">（読み取り専用）</span>
+      </h2>
+
+      <div id="mem-overview" class="text-xs"></div>
+
+      {/* 想起の再現：一覧を眺めるだけでは「なぜAIがこう答えたか」に届かないため */}
+      <div class="border-t border-slate-800 pt-3">
+        <label class="block text-[11px] text-slate-400 mb-1">
+          この質問で実際に引かれる記憶を確認する（本番と同じ埋め込み・同じ類似度計算）
+        </label>
+        <div class="flex flex-wrap gap-2">
+          <input id="mem-recall-q" type="text" placeholder="例: 次のイベントはいつ？ / アンバーは強い？"
+            class="flex-1 min-w-[220px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm" />
+          <button id="mem-btn-recall" class="bg-indigo-700 hover:bg-indigo-600 disabled:opacity-40 rounded-lg px-3 py-2 text-sm transition">
+            <i class="fas fa-magnifying-glass mr-1"></i>想起を再現
+          </button>
+        </div>
+        <div id="mem-recall-out" class="mt-2 text-xs"></div>
+      </div>
+
+      {/* 系統ごとの一覧 */}
+      <div class="border-t border-slate-800 pt-3">
+        <div class="flex flex-wrap items-center gap-2 mb-2">
+          <select id="mem-kind" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs">
+            <option value="meta_knowledge">環境知識（今の環境）</option>
+            <option value="ability_knowledge">キーワード能力の裁定知識</option>
+            <option value="synergy_memory">検証済みシナジー事例</option>
+            <option value="card_vectors">カードの意味ベクトル</option>
+            <option value="rule_vectors">総合ルール条文のベクトル</option>
+            <option value="faq_vectors">公式Q&amp;Aのベクトル</option>
+          </select>
+          <select id="mem-scope" class="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-xs">
+            <option value="">すべての区分</option>
+          </select>
+          <input id="mem-q" type="text" placeholder="本文を検索"
+            class="flex-1 min-w-[160px] bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs" />
+          <button id="mem-btn-list" class="bg-slate-700 hover:bg-slate-600 rounded-lg px-3 py-1.5 text-xs transition">
+            <i class="fas fa-list mr-1"></i>表示
+          </button>
+        </div>
+        <div id="mem-list" class="text-xs"></div>
+        <div class="flex items-center gap-2 mt-2">
+          <button id="mem-btn-prev" class="bg-slate-800 hover:bg-slate-700 disabled:opacity-30 rounded px-2 py-1 text-xs transition">前へ</button>
+          <span id="mem-page" class="text-[11px] text-slate-500"></span>
+          <button id="mem-btn-next" class="bg-slate-800 hover:bg-slate-700 disabled:opacity-30 rounded px-2 py-1 text-xs transition">次へ</button>
+        </div>
+      </div>
+
+      <p class="text-[11px] text-slate-500 leading-relaxed">
+        「未ベクトル化」は<strong class="text-slate-400">AIから引けない＝覚えていないのと同じ</strong>状態です。0以外なら⑤を実行してください。<br />
+        ベクトルの生値（1件1KB）は表示しません。代わりに次元とノルムで健全性を示します（正規化済みならノルムは1.0）。
+      </p>
+    </div>
+
     <!-- 実行ログ -->
     <div class="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
       <h2 class="text-sm font-semibold text-slate-300 mb-2">実行ログ</h2>

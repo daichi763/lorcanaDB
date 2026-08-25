@@ -648,13 +648,43 @@ curl http://localhost:3000/api/ai/status   # {"available":true,…} なら AI �
 **AI 未設定でもサイト全体は動作します**。`/api/ai/status` が `available:false` を返すと
 UI は AI タブに案内を出し、種族逆引きなど他の機能はそのまま使えます。
 
+### 記憶層ブラウザ（管理画面）
+
+AI の回答品質は**記憶層の中身**で決まる。しかし記憶層はベクトル（BLOB）と要約テキストの塊で、
+外からは中身が見えない。「古い環境情報を今のことのように話す」「関係ないカードを挙げる」
+といった不具合は、**記憶側の問題か生成側の問題か**を切り分けないと直せない。
+そのため隠し管理画面に読み取り専用のブラウザを置いた。
+
+| API | 内容 |
+| --- | --- |
+| `GET /api/_ops/memory/overview` | 6系統の件数と健全性。`missing`（未ベクトル化）/ `orphans`（元データが消えた孤児ベクトル）/ `health.issues` を返す |
+| `GET /api/_ops/memory/list?kind=&q=&scope=&offset=&limit=` | 系統ごとの一覧。`kind` は `meta_knowledge` / `ability_knowledge` / `synergy_memory` / `card_vectors` / `rule_vectors` / `faq_vectors` の6種のみ（他は `400 bad_kind`）。`limit` は最大100 |
+| `POST /api/_ops/memory/recall` `{query, top_k?, min_sim?}` | **想起の再現**。本番と同じ埋め込み（`text-embedding-3-small` / 256次元）・同じ類似度計算で引き直し、環境知識・カード・総合ルール条文・公式Q&A の4区分を類似度付きで返す |
+
+設計上の判断:
+
+- **読み取り専用**。記憶の更新は既存の再構築パイプライン（管理画面の①〜⑤）経由に限る。
+  ここから書き換えられると、`text_hash` とベクトルの整合が崩れて原因追跡が不可能になる。
+  書き込み口が無いことはテストでも確認している（POST / DELETE が 404）。
+- **ベクトルの生値は返さない**。1件1KB × 2,500件を画面に流しても読めない。
+  代わりに `dims`（256か）と `norm`（正規化済みなら1.0）で健全性を示す。
+- **未ベクトル化は赤字で強調**する。ベクトルが無い記憶は**AIから引けない＝覚えていないのと同じ**で、
+  件数だけ見ていると「入っているのに使われない」状態を見逃す。
+- **1つのAPIに `kind` を渡す**形にした（6本のエンドポイントに分けていない）。
+  系統が増えるたびにルートと認証を書き足すのは事故のもと。
+- **想起の再現を同梱**した。一覧を眺めるだけでは「なぜAIがこう答えたか」に届かない。
+
+`synergy_memory` の `base_id` が `NULL` の行は、**自由記述だけで探索した正常な記録**
+（起点カードを指定していない）。画面では「自由記述からの探索」と明示する。
+欠損と誤読されないようにするため。
+
 ### UI 自動テスト
 
 ```bash
 node scraper/test_synergy_ui.mjs   # jsdom で /synergy を実動作検証（35項目）
-node scraper/test_admin.mjs        # 隠し管理画面の秘匿性・認証・CORS分離・機能を検証（44項目）
+node scraper/test_admin.mjs        # 隠し管理画面の秘匿性・認証・CORS分離・記憶層ブラウザを検証（117項目）
 node scraper/test_faq_memory.mjs   # 公式Q&AのAI分析への組み込みを検証（33項目）
-node scraper/test_meta.mjs         # 最新環境情報（引用方針・出自分離・帰属表示・認証）を検証（88項目）
+node scraper/test_meta.mjs         # 最新環境情報（引用方針・出自分離・帰属表示・出力言語・認証）を検証（117項目）
 ```
 ※ どちらもプロジェクトディレクトリ内から実行してください（jsdom の解決のため）。
 

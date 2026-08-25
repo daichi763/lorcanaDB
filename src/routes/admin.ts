@@ -58,6 +58,14 @@ import {
   metaVectorsReady,
   upsertKnowledge,
 } from '../lib/metaReport';
+import {
+  MEMORY_KINDS,
+  memoryList,
+  memoryOverview,
+  memoryScopes,
+  recallProbe,
+  type MemoryKind,
+} from '../lib/memoryBrowse';
 import { ocrStats, runOcrBatch } from '../lib/ocr';
 
 const admin = new Hono<{ Bindings: Bindings }>();
@@ -783,6 +791,76 @@ admin.get('/meta/status', async (c) => {
     raw_by_source: raw,
     ocr,
   });
+});
+
+// ============================ 記憶層ブラウザ（読み取り専用） ============================
+//
+// AIの回答品質は記憶層の中身で決まるが、記憶層はベクトル(BLOB)と要約テキストの塊で
+// 外から見えない。不具合の切り分けができるよう、管理画面から覗けるようにする。
+// 書き込み系は意図的に用意しない（記憶の更新は必ず既存パイプライン経由）。
+
+/**
+ * GET /memory/overview
+ * 記憶層6系統のサマリと健全性（未ベクトル化・孤児ベクトルの検出）。
+ */
+admin.get('/memory/overview', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const [ov, scopes] = await Promise.all([memoryOverview(db), memoryScopes(db)]);
+  return c.json({ success: true, ...ov, scopes });
+});
+
+/**
+ * GET /memory/list?kind=&q=&scope=&offset=&limit=
+ * 系統ごとの記憶を一覧する。ベクトルの生値は返さず健全性の指標のみ返す。
+ */
+admin.get('/memory/list', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  const kind = String(c.req.query('kind') || 'meta_knowledge') as MemoryKind;
+  if (!(MEMORY_KINDS as readonly string[]).includes(kind)) {
+    return c.json({ error: 'bad_kind', allowed: MEMORY_KINDS }, 400);
+  }
+  const out = await memoryList(db, kind, {
+    q: c.req.query('q') || '',
+    scope: c.req.query('scope') || '',
+    offset: Number(c.req.query('offset') || 0),
+    limit: Number(c.req.query('limit') || 20),
+  });
+  return c.json({ success: true, ...out });
+});
+
+/**
+ * POST /memory/recall  { query, top_k?, min_sim? }
+ * 任意の質問文で「実際にどの記憶が引かれるか」を本番と同じ経路で再現する。
+ * 一覧を見るだけでは届かない「なぜAIがこう答えたか」の切り分けに使う。
+ */
+admin.post('/memory/recall', async (c) => {
+  const un = await requireAuth(c);
+  if (un) return un;
+  const db = c.env.DB;
+  let body: Record<string, unknown> = {};
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: 'invalid_json' }, 400);
+  }
+  const query = String(body.query ?? '').trim().slice(0, 400);
+  if (!query) return c.json({ error: 'empty_query', message: '質問文を入力してください' }, 400);
+
+  try {
+    const out = await recallProbe(c.env, db, query, {
+      topK: Number(body.top_k) || 5,
+      minSim: typeof body.min_sim === 'number' ? body.min_sim : undefined,
+    });
+    return c.json({ success: true, ...out });
+  } catch (e: any) {
+    const msg = e?.message || String(e);
+    // AI未設定でも管理画面全体が落ちないよう、想起だけ失敗として返す
+    return c.json({ error: 'recall_failed', message: msg }, e?.status === 503 ? 503 : 500);
+  }
 });
 
 export default admin;

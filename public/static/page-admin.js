@@ -80,6 +80,8 @@
     $('op-panel').classList.remove('hidden');
     refreshStatus();
     refreshMetaStatus();
+    memOverview();
+    memList(true);
   }
 
   // ------------------------------------------------------------ 状態表示
@@ -575,6 +577,283 @@
         : '');
   }
 
+  // ============================================================ 記憶層ブラウザ
+  /**
+   * 記憶層（AIが引く材料）の閲覧。読み取り専用。
+   *
+   * なぜ必要か: AIの回答品質は記憶層の中身で決まるのに、記憶層はベクトル(BLOB)と
+   * 要約テキストの塊で外から見えない。「古い環境情報を今のことのように話す」
+   * 「関係ないカードを挙げる」といった不具合は、記憶側の問題か生成側の問題かを
+   * 切り分けないと直せない。そのため
+   *   ① 系統ごとの件数と健全性（未ベクトル化・孤児・ノルム）
+   *   ② 任意の質問で実際に引かれる記憶の再現
+   * の2つを出す。
+   */
+  const MEM_STATE = { kind: 'meta_knowledge', offset: 0, limit: 20, total: 0 };
+
+  /** 未ベクトル化＝AIから引けない、なので0以外は必ず目立たせる */
+  function memBadge(n, label) {
+    const v = Number(n ?? 0);
+    if (!v) return `<span class="text-slate-500">${esc(label)} 0</span>`;
+    return `<span class="text-rose-300 font-semibold">${esc(label)} ${v.toLocaleString()}</span>`;
+  }
+
+  async function memOverview() {
+    const host = $('mem-overview');
+    if (!host) return;
+    host.innerHTML = '<span class="text-slate-500">読み込み中...</span>';
+    let d;
+    try {
+      d = await call('/memory/overview');
+    } catch (e) {
+      host.innerHTML = `<span class="text-rose-300">記憶層の状態を取得できません（${esc(e.message)}）</span>`;
+      return;
+    }
+
+    const health = d.health || {};
+    const head = health.ok
+      ? '<div class="text-emerald-300 mb-2"><i class="fas fa-circle-check mr-1"></i>記憶層は健全です（未ベクトル化・孤児なし）</div>'
+      : `<div class="text-amber-300 mb-2"><i class="fas fa-triangle-exclamation mr-1"></i>` +
+        (health.issues || []).map((x) => esc(x)).join(' / ') +
+        `</div>`;
+
+    const rows = (d.kinds || [])
+      .map((k) => {
+        // 元テーブルを持たない系統（ability/synergy）は「未ベクトル化」の概念がないので '—'
+        const hasSrc = k.source_rows !== null && k.source_rows !== undefined;
+        return `
+        <tr class="border-t border-slate-800 align-top">
+          <td class="py-1.5 pr-2">
+            <div class="text-slate-200">${esc(k.label)}</div>
+            <div class="text-[10px] text-slate-500 leading-snug">${esc(k.description)}</div>
+          </td>
+          <td class="py-1.5 pr-2 text-right text-slate-100 font-semibold whitespace-nowrap">${Number(k.rows ?? 0).toLocaleString()}</td>
+          <td class="py-1.5 pr-2 text-right text-slate-400 whitespace-nowrap">${hasSrc ? Number(k.source_rows).toLocaleString() : '—'}</td>
+          <td class="py-1.5 pr-2 whitespace-nowrap">${hasSrc ? memBadge(k.missing, '未ベクトル化') : '<span class="text-slate-600">—</span>'}</td>
+          <td class="py-1.5 pr-2 whitespace-nowrap">${hasSrc ? memBadge(k.orphans, '孤児') : '<span class="text-slate-600">—</span>'}</td>
+          <td class="py-1.5 text-slate-500 whitespace-nowrap">${esc(String(k.updated_at ?? '—').slice(0, 16))}</td>
+        </tr>`;
+      })
+      .join('');
+
+    host.innerHTML =
+      head +
+      `<div class="overflow-x-auto"><table class="w-full text-[11px]">
+        <thead class="text-slate-500">
+          <tr>
+            <th class="text-left font-normal pb-1">系統</th>
+            <th class="text-right font-normal pb-1">記憶件数</th>
+            <th class="text-right font-normal pb-1">元データ</th>
+            <th class="text-left font-normal pb-1">欠け</th>
+            <th class="text-left font-normal pb-1">余り</th>
+            <th class="text-left font-normal pb-1">最終更新</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table></div>`;
+
+    // 区分プルダウンは実データから作る（固定リストにすると新しい scope を取りこぼす）
+    const sel = $('mem-scope');
+    if (sel && Array.isArray(d.scopes)) {
+      const cur = sel.value;
+      sel.innerHTML =
+        '<option value="">すべての区分</option>' +
+        d.scopes.map((s) => `<option value="${esc(s.scope)}">${esc(s.scope)}（${s.rows}）</option>`).join('');
+      sel.value = cur;
+    }
+  }
+
+  /** 想起の再現。本番と同じ埋め込み・同じ類似度計算を通す */
+  async function memRecall() {
+    const q = ($('mem-recall-q')?.value || '').trim();
+    const out = $('mem-recall-out');
+    if (!out) return;
+    if (!q) {
+      out.innerHTML = '<span class="text-amber-300">質問文を入力してください。</span>';
+      return;
+    }
+    const btn = $('mem-btn-recall');
+    if (btn) btn.disabled = true;
+    out.innerHTML = '<span class="text-slate-500">埋め込みを作って照合中...</span>';
+    let d;
+    try {
+      d = await call('/memory/recall', { query: q, top_k: 5 });
+    } catch (e) {
+      out.innerHTML =
+        e.status === 503
+          ? '<span class="text-rose-300">埋め込みAPIが使えません（OPENAI_API_KEY 未設定、または一時的な障害）。</span>'
+          : `<span class="text-rose-300">想起の再現に失敗しました（${esc(e.message)}）</span>`;
+      if (btn) btn.disabled = false;
+      return;
+    }
+    if (btn) btn.disabled = false;
+
+    // 類似度は目で比べたいので数値とバーの両方を出す
+    const bar = (sim) => {
+      const p = Math.max(0, Math.min(1, Number(sim) || 0)) * 100;
+      const color = p >= 50 ? 'bg-emerald-500' : p >= 35 ? 'bg-amber-500' : 'bg-slate-600';
+      return `<span class="inline-block w-16 h-1.5 bg-slate-800 rounded align-middle mr-1"><span class="block h-1.5 rounded ${color}" style="width:${p.toFixed(0)}%"></span></span>`;
+    };
+
+    const section = (title, items, render) => {
+      if (!items || !items.length) {
+        return `<div class="mb-2"><div class="text-slate-400 mb-0.5">${esc(title)}</div><div class="text-slate-600">該当なし（閾値未満）</div></div>`;
+      }
+      return (
+        `<div class="mb-2"><div class="text-slate-400 mb-0.5">${esc(title)}</div>` +
+        items
+          .map(
+            (x) =>
+              `<div class="flex items-start gap-1 py-0.5">` +
+              `<span class="text-slate-500 tabular-nums w-10 text-right shrink-0">${Number(x.sim).toFixed(3)}</span>` +
+              bar(x.sim) +
+              `<span class="flex-1 min-w-0">${render(x)}</span></div>`
+          )
+          .join('') +
+        `</div>`
+      );
+    };
+
+    out.innerHTML =
+      `<div class="text-[10px] text-slate-500 mb-1">埋め込みモデル: ${esc(d.model)}</div>` +
+      section('環境知識', d.meta, (x) =>
+        `<span class="text-slate-200">${esc(x.title)}</span>` +
+        `<span class="text-slate-500 ml-1">[${esc(x.scope)}${x.observed_at ? ' / ' + esc(String(x.observed_at).slice(0, 10)) : ''}]</span>` +
+        `<div class="text-slate-500 leading-snug">${esc(x.body)}</div>`
+      ) +
+      section('カード', d.cards, (x) => `<span class="text-slate-200">${esc(x.name)}</span>`) +
+      section('総合ルール条文', d.rules, (x) => `<span class="text-slate-200">${esc(x.label)}</span>`) +
+      section('公式Q&A', d.faqs, (x) => `<span class="text-slate-200">${esc(x.question)}</span>`);
+  }
+
+  /** 系統ごとの一覧描画。系統によって意味のある列が違うので分岐する */
+  function memRenderItems(kind, items) {
+    if (!items.length) return '<div class="text-slate-500 py-2">該当する記憶がありません。</div>';
+
+    if (kind === 'meta_knowledge') {
+      return items
+        .map(
+          (x) => `
+        <div class="border-t border-slate-800 py-1.5">
+          <div class="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            <span class="text-slate-200">${esc(x.title)}</span>
+            <span class="text-[10px] px-1 rounded bg-slate-800 text-slate-400">${esc(x.scope)}</span>
+            <span class="text-[10px] text-slate-500">${esc(String(x.observed_at ?? '').slice(0, 10))}</span>
+            <span class="text-[10px] text-slate-500">信頼度 ${x.trust}</span>
+            ${x.vector_ok
+              ? '<span class="text-[10px] text-emerald-400">ベクトル済</span>'
+              : '<span class="text-[10px] text-rose-300 font-semibold">未ベクトル化（AIから引けません）</span>'}
+            ${x.official_url
+              ? `<a href="${esc(x.official_url)}" target="_blank" rel="noopener" class="text-[10px] text-sky-400 hover:underline">公式</a>`
+              : ''}
+          </div>
+          <div class="text-slate-400 leading-snug mt-0.5">${esc(x.body)}</div>
+        </div>`
+        )
+        .join('');
+    }
+
+    if (kind === 'ability_knowledge') {
+      return items
+        .map(
+          (x) => `
+        <div class="border-t border-slate-800 py-1.5">
+          <div class="text-slate-200">${esc(x.ability)}</div>
+          <div class="text-slate-400 leading-snug mt-0.5">${esc(x.summary)}</div>
+          ${x.caveats.length
+            ? `<div class="text-amber-300/80 leading-snug mt-0.5">注意: ${x.caveats.map((c) => esc(c)).join(' / ')}</div>`
+            : ''}
+          ${x.sections.length
+            ? `<div class="text-[10px] text-slate-500 mt-0.5">根拠条文: ${x.sections.map((c) => esc(c)).join(', ')}</div>`
+            : ''}
+        </div>`
+        )
+        .join('');
+    }
+
+    if (kind === 'synergy_memory') {
+      return items
+        .map((x) => {
+          // base_id が NULL なのは「自由記述だけの探索」で起点カードが無い正常な行。
+          // 「(不明)」と出すと欠損に見えて誤診されるので、由来を明示する。
+          const from = x.base_id === null || x.base_id === undefined
+            ? '<span class="text-slate-500">自由記述からの探索</span>'
+            : esc(x.base_name ?? `#${x.base_id}`);
+          return `
+        <div class="border-t border-slate-800 py-1.5">
+          <div class="flex flex-wrap items-center gap-x-2">
+            <span class="text-slate-200">${from} → ${esc(x.partner_name ?? `#${x.partner_id}`)}</span>
+            <span class="text-[10px] text-slate-500">評点 ${x.score}</span>
+            <span class="text-[10px] text-slate-500">採用 ${x.hits}回</span>
+          </div>
+          <div class="text-slate-400 leading-snug mt-0.5">${esc(x.reason)}</div>
+        </div>`;
+        })
+        .join('');
+    }
+
+    // ベクトル系。生値は返らないので次元とノルムで健全性を見る
+    return items
+      .map(
+        (x) => `
+      <div class="border-t border-slate-800 py-1.5">
+        <div class="flex flex-wrap items-center gap-x-2">
+          <span class="text-slate-200">${esc(x.label)}</span>
+          <span class="text-[10px] text-slate-500">#${x.ref_id}</span>
+          <span class="text-[10px] ${x.dims_ok ? 'text-slate-500' : 'text-rose-300 font-semibold'}">${x.dims}次元</span>
+          <span class="text-[10px] ${x.norm_ok ? 'text-slate-500' : 'text-rose-300 font-semibold'}">ノルム ${Number(x.norm).toFixed(4)}</span>
+        </div>
+        <div class="text-slate-500 leading-snug mt-0.5">${esc(x.source_text)}</div>
+      </div>`
+      )
+      .join('');
+  }
+
+  async function memList(resetOffset) {
+    const host = $('mem-list');
+    if (!host) return;
+    if (resetOffset) MEM_STATE.offset = 0;
+    MEM_STATE.kind = $('mem-kind')?.value || 'meta_knowledge';
+
+    const params = new URLSearchParams({
+      kind: MEM_STATE.kind,
+      offset: String(MEM_STATE.offset),
+      limit: String(MEM_STATE.limit),
+    });
+    const q = ($('mem-q')?.value || '').trim();
+    if (q) params.set('q', q);
+    // scope は環境知識にしか無いので、他系統では送らない
+    const scope = MEM_STATE.kind === 'meta_knowledge' ? $('mem-scope')?.value || '' : '';
+    if (scope) params.set('scope', scope);
+
+    host.innerHTML = '<span class="text-slate-500">読み込み中...</span>';
+    let d;
+    try {
+      d = await call('/memory/list?' + params.toString());
+    } catch (e) {
+      host.innerHTML = `<span class="text-rose-300">一覧を取得できません（${esc(e.message)}）</span>`;
+      return;
+    }
+    MEM_STATE.total = Number(d.total ?? 0);
+    host.innerHTML = memRenderItems(d.kind, d.items || []);
+    memRenderPager();
+  }
+
+  function memRenderPager() {
+    const { offset, limit, total } = MEM_STATE;
+    const from = total ? offset + 1 : 0;
+    const to = Math.min(offset + limit, total);
+    const page = $('mem-page');
+    if (page) page.textContent = `${from}–${to} / ${total.toLocaleString()} 件`;
+    const prev = $('mem-btn-prev');
+    const next = $('mem-btn-next');
+    if (prev) prev.disabled = offset <= 0;
+    if (next) next.disabled = offset + limit >= total;
+    // 区分プルダウンは環境知識のときだけ意味を持つ
+    const sc = $('mem-scope');
+    if (sc) sc.disabled = MEM_STATE.kind !== 'meta_knowledge';
+  }
+
   // ------------------------------------------------------------ 初期化
   document.addEventListener('DOMContentLoaded', async () => {
     $('op-login-form')?.addEventListener('submit', login);
@@ -591,6 +870,7 @@
     $('op-btn-refresh')?.addEventListener('click', () => {
       refreshStatus();
       refreshMetaStatus();
+      memOverview();
     });
 
     // 最新環境情報（日次更新）の4段
@@ -600,6 +880,27 @@
     $('op-btn-meta-summarize')?.addEventListener('click', metaRunner(metaSummarize, '要約生成'));
     $('op-btn-meta-memory')?.addEventListener('click', metaRunner(metaMemory, '記憶層への反映'));
     $('op-btn-meta-all')?.addEventListener('click', metaRunner(metaRunAll, '日次更新'));
+
+    // 記憶層ブラウザ
+    $('mem-btn-recall')?.addEventListener('click', memRecall);
+    $('mem-recall-q')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') memRecall();
+    });
+    $('mem-btn-list')?.addEventListener('click', () => memList(true));
+    $('mem-q')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') memList(true);
+    });
+    // 系統/区分を変えたら即反映（「表示」を押させると変えたのに古い一覧が残って混乱する）
+    $('mem-kind')?.addEventListener('change', () => memList(true));
+    $('mem-scope')?.addEventListener('change', () => memList(true));
+    $('mem-btn-prev')?.addEventListener('click', () => {
+      MEM_STATE.offset = Math.max(0, MEM_STATE.offset - MEM_STATE.limit);
+      memList(false);
+    });
+    $('mem-btn-next')?.addEventListener('click', () => {
+      MEM_STATE.offset += MEM_STATE.limit;
+      memList(false);
+    });
 
     // 既にセッションがあればパネルを出す
     try {
